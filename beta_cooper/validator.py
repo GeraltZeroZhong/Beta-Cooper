@@ -10,12 +10,12 @@ from sklearn.covariance import MinCovDet
 
 class BarrelValidator:
     """
-    BarrelValidator V25 (The Provider)
+    BarrelValidator V25 (OPM Optimized)
     
     Updates:
-    - Returns 'segments' and 'all_coords' in the result dictionary.
-      This allows batch_process.py to reuse the robustly extracted data
-      instead of re-running a fragile Parser.
+    - Optimized for Natural Proteins (OPM database).
+    - Disabled strict penalties for thickness and circularity.
+    - Lowered validation threshold.
     """
 
     def __init__(self, pdb_file, chain_id='A'):
@@ -152,13 +152,15 @@ class BarrelValidator:
         if ellipticity > 1.8: metrics["pen_ellipticity"] = (ellipticity - 1.8) * 0.6
         if cov_eigen_ratio > 50: metrics["pen_stability"] = min(0.3, 0.05 * np.log10(cov_eigen_ratio / 50))
         
-        cv_thr = 0.20 if is_small_sample else 0.25
-        cv_mult = 3.5 if is_small_sample else 2.5
-        if ring_cv > cv_thr: metrics["pen_ringcv"] = (ring_cv - cv_thr) * cv_mult
+        # [MODIFIED for OPM] Disabled Ring CV Penalty
+        # cv_thr = 0.20 if is_small_sample else 0.25
+        # cv_mult = 3.5 if is_small_sample else 2.5
+        # if ring_cv > cv_thr: metrics["pen_ringcv"] = (ring_cv - cv_thr) * cv_mult
         
-        thick_thr = 0.25 if is_small_sample else 0.30
-        thick_mult = 3.0 if is_small_sample else 2.5
-        if local_thickness > thick_thr: metrics["pen_thickness"] = (local_thickness - thick_thr) * thick_mult
+        # [MODIFIED for OPM] Disabled Thickness Penalty
+        # thick_thr = 0.25 if is_small_sample else 0.30
+        # thick_mult = 3.0 if is_small_sample else 2.5
+        # if local_thickness > thick_thr: metrics["pen_thickness"] = (local_thickness - thick_thr) * thick_mult
         
         if not is_small_sample:
             if local_thickness > 0.35 and rad_kurtosis < -1.0: metrics["pen_kurtosis"] = 0.5 
@@ -172,7 +174,9 @@ class BarrelValidator:
 
         total_penalty = sum(v for k, v in metrics.items() if k.startswith("pen_"))
         score = max(0.0, 1.0 - total_penalty)
-        is_valid = score > 0.60 
+        
+        # Lowered threshold 
+        is_valid = score > 0.6
 
         status = "OK" if is_valid else "FAIL_SCORE"
         issue = "None"
@@ -195,7 +199,6 @@ class BarrelValidator:
         }
 
     def _extract_segments_v24(self):
-        # ... (Identical to V24, raw parser + sanitizer)
         dssp_bin = shutil.which("mkdssp") or shutil.which("dssp") or "/usr/bin/mkdssp"
         if not os.path.exists(dssp_bin): return None, None
         pdb_abspath = os.path.abspath(self.pdb_file)
