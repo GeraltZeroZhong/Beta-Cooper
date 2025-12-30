@@ -49,34 +49,38 @@ class ProteinParser:
 
     def run_dssp(self, dssp_bin=None):
         """
-        Executes DSSP.
-        Args:
-            dssp_bin (str): Path to mkdssp executable. If None, tries to find in PATH.
-        Returns:
-            dict: The DSSP object (keys: (chain, res_id)).
+        Executes DSSP with verbose debugging and explicit binary path.
         """
         if self.dssp is not None:
             return self.dssp
 
-        # 1. Resolve Binary
+        # --- FIX: Explicitly find binary if not provided ---
         if dssp_bin is None:
-            # Common names for the binary
-            for name in ["mkdssp", "dssp"]:
-                if shutil.which(name):
-                    dssp_bin = name
-                    break
+            # 优先尝试 mkdssp (Conda 环境通常叫这个)
+            if shutil.which("mkdssp"):
+                dssp_bin = shutil.which("mkdssp")
+            elif shutil.which("dssp"):
+                dssp_bin = shutil.which("dssp")
+            # 如果上面都找不到，尝试硬编码 (请根据你的 'which mkdssp' 结果修改这里!)
+            # else:
+            #     dssp_bin = "/home/zero/miniconda3/envs/evofast/bin/mkdssp"
         
-        if not dssp_bin or not shutil.which(dssp_bin):
-            raise RuntimeError("DSSP binary not found! Please install 'dssp' or 'mkdssp' and add to PATH.")
+        if not dssp_bin or not os.path.exists(dssp_bin):
+            raise RuntimeError(f"DSSP binary not found. Looked for 'mkdssp'/'dssp'. PATH={os.environ.get('PATH')}")
 
-        # 2. Run DSSP
+        # --- FIX: Use absolute path for PDB file ---
+        abs_path = os.path.abspath(self.file_path)
+
         try:
-            # Note: Biopython's DSSP class handles the temp file creation internally
-            self.dssp = DSSP(self.model, self.file_path, dssp=dssp_bin)
+            # Biopython 1.78+ DSSP class
+            self.dssp = DSSP(self.model, abs_path, dssp=dssp_bin)
             return self.dssp
         except Exception as e:
-            raise RuntimeError(f"DSSP execution failed for {self.file_path}: {str(e)}")
-
+            # 打印详细错误到控制台，方便调试
+            print(f"!!! DSSP CRASHED on {abs_path} using binary {dssp_bin} !!!")
+            print(f"Error details: {str(e)}")
+            raise RuntimeError(f"DSSP failed: {str(e)}")
+        
     def get_chain(self, chain_id):
         """Safe chain retrieval."""
         if chain_id in self.model:
