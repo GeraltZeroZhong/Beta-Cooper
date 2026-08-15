@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 import pytest
 
 from cooper_beta import detect
 from cooper_beta.config import build_config
+from cooper_beta.exceptions import DsspError, DsspNotFoundError
 from cooper_beta.integrity import file_sha256
 from cooper_beta.polymer_sequence import declared_polymer_sequence_for_author_chain
+from cooper_beta.runtime import require_dssp_binary
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = REPOSITORY_ROOT / "examples"
+
+
+def _supported_dssp_is_available() -> bool:
+    try:
+        require_dssp_binary()
+    except (DsspError, DsspNotFoundError):
+        return False
+    return True
 
 
 def test_curated_positive_examples_match_their_manifest() -> None:
@@ -40,8 +49,8 @@ def test_curated_positive_examples_match_their_manifest() -> None:
 
 
 @pytest.mark.skipif(
-    shutil.which("mkdssp") is None and shutil.which("dssp") is None,
-    reason="DSSP is required for the real-structure regression test.",
+    not _supported_dssp_is_available(),
+    reason="DSSP 4.5.3 or newer is required for the real-structure regression test.",
 )
 def test_curated_positives_match_strand_graph_and_decision_contract() -> None:
     config = build_config(

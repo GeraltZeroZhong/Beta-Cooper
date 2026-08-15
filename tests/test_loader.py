@@ -12,7 +12,7 @@ from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 from cooper_beta.chain_analysis import analyze_chain_payload
 from cooper_beta.config import build_config
 from cooper_beta.dssp_adapter import DsspAnnotation, DsspStrandRecord
-from cooper_beta.exceptions import DsspError, StructureParseError
+from cooper_beta.exceptions import DsspError, DsspNotFoundError, StructureParseError
 from cooper_beta.loader import (
     ProteinLoader,
     _infer_element_from_atom_name,
@@ -21,6 +21,7 @@ from cooper_beta.loader import (
     _selected_model_mmcif_path,
 )
 from cooper_beta.preparation import PrepareFailure, prepare_one_file
+from cooper_beta.runtime import require_dssp_binary
 from cooper_beta.strand_graph import measure_strand_graph
 
 MINIMAL_MODEL_PDB = """\
@@ -148,6 +149,14 @@ def _install_assignments(
     loader._install_dssp_annotation(DsspAnnotation(assignments, (), ()))
 
 
+def _supported_dssp_is_available() -> bool:
+    try:
+        require_dssp_binary()
+    except (DsspError, DsspNotFoundError):
+        return False
+    return True
+
+
 def test_pdb_atom_name_alignment_distinguishes_alpha_carbon_from_calcium():
     assert _infer_element_from_atom_name(" CA ") == "C"
     assert _infer_element_from_atom_name("CA  ") == "Ca"
@@ -160,6 +169,10 @@ def test_pdb_atom_name_alignment_distinguishes_alpha_carbon_from_calcium():
         ("M4QT10.cif", 8, 8, 8),
         ("A0A2R4ALS6.cif", 9, 9, 8),
     ],
+)
+@pytest.mark.skipif(
+    not _supported_dssp_is_available(),
+    reason="DSSP 4.5.3 or newer is required for the real-structure regression test.",
 )
 def test_true_positive_examples_have_fresh_closed_strand_graphs(
     example_name: str,

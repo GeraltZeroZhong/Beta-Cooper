@@ -59,7 +59,7 @@ jobs:
         run: uv pip check --python .venv/bin/python
 
   quality:
-    name: Quality and coverage
+    name: Quality
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -100,9 +100,6 @@ jobs:
           uv run --isolated --locked --python 3.10 --extra dev
           python -m mypy --python-version 3.10 --no-incremental
 
-      - name: Test with branch coverage
-        run: .venv/bin/python -m pytest --cov=cooper_beta --cov-report=term-missing --cov-report=xml
-
       - name: Compile all maintained Python sources
         run: .venv/bin/python -m compileall -q src scripts data/scripts external_methods tests
 
@@ -110,7 +107,7 @@ jobs:
         run: .venv/bin/python -m check_manifest -v
 
   dssp-integration:
-    name: Locked DSSP integration
+    name: Locked DSSP integration and coverage
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -133,6 +130,10 @@ jobs:
       - name: Install locked Python graph into the Conda prefix
         shell: micromamba-shell {0}
         run: UV_PROJECT_ENVIRONMENT="${CONDA_PREFIX}" uv sync --locked --extra full --extra dev
+
+      - name: Test with branch coverage
+        shell: micromamba-shell {0}
+        run: python -m pytest --cov=cooper_beta --cov-report=term-missing --cov-report=xml
 
       - name: Fetch checksum-pinned experimental structure
         shell: micromamba-shell {0}
