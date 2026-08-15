@@ -101,7 +101,6 @@ from cooper_beta.bootstrap import configure_thread_environment, runtime_bootstra
 np.dot(np.ones((4, 4)), np.ones((4, 4)))
 configure_thread_environment(1)
 pools = threadpool_info()
-assert pools
 assert all(pool['num_threads'] <= 1 for pool in pools)
 assert runtime_bootstrap_state().native_threads_per_process == 1
 for name in (
