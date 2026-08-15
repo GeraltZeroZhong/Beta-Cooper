@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "retrieved_at_utc": "2026-08-11T14:14:41Z",
+  "source": "AlphaFold Protein Structure Database",
+  "provider": "BFVD",
+  "tool": "ColabFold v1.5.2",
+  "license": "CC-BY-4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "examples": [
+    {
+      "uniprot_accession": "M4QT10",
+      "file": "M4QT10.cif",
+      "sha256": "d4a988f5c8b125c021d763e0bd986fe7dac904c4d190df8d5a4a0d5b3f63c45e",
+      "source_record_id": "AF-0000000000174160",
+      "model_created_date": "2025-03-17",
+      "source_url": "https://alphafold.ebi.ac.uk/entry/AF-0000000000174160",
+      "target_author_chain_id": "A",
+      "sequence_length": 137,
+      "scientific_label": "positive",
+      "expected_result": "BARREL",
+      "global_plddt": 88.21,
+      "pae_summary": "One rigid domain was detected across residues 33-137."
+    },
+    {
+      "uniprot_accession": "A0A2R4ALS6",
+      "file": "A0A2R4ALS6.cif",
+      "sha256": "d39428fcf23e3a8c29f29266b0b41bd0276b746674d9a9cd82b677a1627cee52",
+      "source_record_id": "AF-0000000000229322",
+      "model_created_date": "2025-03-17",
+      "source_url": "https://alphafold.ebi.ac.uk/entry/AF-0000000000229322",
+      "target_author_chain_id": "A",
+      "sequence_length": 135,
+      "scientific_label": "positive",
+      "expected_result": "BARREL",
+      "global_plddt": 73.03,
+      "pae_summary": "No rigid domain longer than 50 residues was detected by the PAE heuristic; the curated positive label remains authoritative for this repository."
+    }
+  ]
+}

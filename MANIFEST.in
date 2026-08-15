@@ -2,12 +2,18 @@ include LICENSE
 include README.md
 include pyproject.toml
 include environment.yml
+include uv.lock
+include conda-lock.yml
 include scripts/setup_env.sh
+recursive-include examples *.cif *.json
+recursive-include data/scripts *.py
+recursive-include scripts *.py
 recursive-include tests *.py
 exclude tests/test_external_isitabarrel.py
 exclude tests/test_external_pred_tmbb2.py
 exclude tests/test_external_foldseek.py
 recursive-include src/cooper_beta/conf *.yaml
+include src/cooper_beta/py.typed
 recursive-exclude data/external_methods *
 recursive-exclude external_methods *
 global-exclude __pycache__ *.py[cod] .DS_Store

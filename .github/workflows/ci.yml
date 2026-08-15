@@ -1,0 +1,303 @@
+name: Continuous integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.11.19"
+  BUILD_SETUPTOOLS_VERSION: "84.0.0"
+  BUILD_WHEEL_VERSION: "0.47.0"
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Set up locked uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked environment
+        env:
+          MATRIX_PYTHON: ${{ matrix.python }}
+        run: uv sync --locked --python "${MATRIX_PYTHON}" --extra full --extra dev
+
+      - name: Run tests
+        run: .venv/bin/python -m pytest -q
+
+      - name: Check installed dependencies
+        run: uv pip check --python .venv/bin/python
+
+  quality:
+    name: Quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up locked uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked environment
+        run: uv sync --locked --python 3.12 --extra full --extra dev
+
+      - name: Verify dependency lock
+        run: uv lock --check
+
+      - name: Lint and format check
+        run: |
+          .venv/bin/python -m ruff check .
+          .venv/bin/python -m ruff format --check .
+
+      - name: Type check
+        run: .venv/bin/python -m mypy
+
+      - name: Type check against Python 3.10
+        run: >-
+          uv run --isolated --locked --python 3.10 --extra dev
+          python -m mypy --python-version 3.10 --no-incremental
+
+      - name: Compile all maintained Python sources
+        run: .venv/bin/python -m compileall -q src scripts data/scripts external_methods tests
+
+      - name: Check source distribution manifest
+        run: .venv/bin/python -m check_manifest -v
+
+  dssp-integration:
+    name: Locked DSSP integration and coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create locked Conda environment
+        uses: mamba-org/setup-micromamba@f457c30a868e4760d3a6fcea5f25dc655b8edf39 # v3.2.1
+        with:
+          environment-file: conda-lock.yml
+          environment-name: cooperbeta-ci
+          micromamba-version: "2.9.0-0"
+          cache-environment: true
+          cache-downloads: true
+          post-cleanup: all
+
+      - name: Install locked Python graph into the Conda prefix
+        shell: micromamba-shell {0}
+        run: UV_PROJECT_ENVIRONMENT="${CONDA_PREFIX}" uv sync --locked --extra full --extra dev
+
+      - name: Test with branch coverage
+        shell: micromamba-shell {0}
+        run: python -m pytest --cov=cooper_beta --cov-report=term-missing --cov-report=xml
+
+      - name: Fetch checksum-pinned experimental structure
+        shell: micromamba-shell {0}
+        run: |
+          structure_path="${RUNNER_TEMP}/1QJ9.cif"
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            https://files.rcsb.org/download/1QJ9.cif \
+            --output "${structure_path}"
+          echo "344425819432d89b3b59869c0b81c55ed46795169218e2ee133f12d3a5597926  ${structure_path}" \
+            | sha256sum --check --strict
+
+      - name: Exercise real DSSP and validate provenance
+        shell: micromamba-shell {0}
+        run: |
+          cooper-beta --check-env
+          output_dir="${RUNNER_TEMP}/cooperbeta-dssp"
+          mkdir -p "${output_dir}"
+          cooper-beta \
+            "${RUNNER_TEMP}/1QJ9.cif" \
+            --workers 1 \
+            --prepare-workers 1 \
+            --out "${output_dir}/result.csv" \
+            runtime.prepare_cache_enabled=false \
+            output.summary_limit=0
+          python - "${output_dir}/result.csv" <<'PY'
+          import csv
+          import json
+          import sys
+          from pathlib import Path
+
+          csv_path = Path(sys.argv[1])
+          with csv_path.open(newline="", encoding="utf-8") as handle:
+              rows = list(csv.DictReader(handle))
+          assert len(rows) == 1
+          assert rows[0]["filename"] == "1QJ9.cif"
+          assert rows[0]["author_chain_id"] == "A"
+          assert rows[0]["result"] == "BARREL"
+          assert rows[0]["degraded"] == "False"
+
+          manifest = json.loads(
+              Path(f"{csv_path}.manifest.json").read_text(encoding="utf-8")
+          )
+          executable = manifest["executables"]
+          assert manifest["schema_version"] == 1
+          assert executable["dssp_resolved_path"]
+          assert executable["dssp_version"]
+          assert len(executable["dssp_sha256"]) == 64
+          assert len(manifest["output_sha256"]) == 64
+          assert manifest["input_file_state"][0]["sha256"] == (
+              "344425819432d89b3b59869c0b81c55ed46795169218e2ee133f12d3a5597926"
+          )
+          PY
+
+      - name: Verify curated positive examples
+        shell: micromamba-shell {0}
+        run: |
+          example_output="${RUNNER_TEMP}/cooperbeta-examples.csv"
+          cooper-beta \
+            examples \
+            --workers 1 \
+            --prepare-workers 1 \
+            --out "${example_output}" \
+            runtime.prepare_cache_enabled=false \
+            output.summary_limit=0
+          python - "${example_output}" <<'PY'
+          import csv
+          import json
+          import sys
+          from pathlib import Path
+
+          from cooper_beta.evaluation.runner import validate_detector_artifact_manifest
+          from cooper_beta.integrity import file_sha256
+
+          csv_path = Path(sys.argv[1]).resolve()
+          repository_root = Path.cwd().resolve()
+          example_manifest = json.loads(
+              (repository_root / "examples" / "manifest.json").read_text(encoding="utf-8")
+          )
+          expected = {
+              entry["file"]: entry for entry in example_manifest["examples"]
+          }
+          with csv_path.open(newline="", encoding="utf-8") as handle:
+              rows = list(csv.DictReader(handle))
+          assert {row["filename"] for row in rows} == set(expected)
+          for row in rows:
+              entry = expected[row["filename"]]
+              assert row["author_chain_id"] == entry["target_author_chain_id"]
+              assert row["result"] == entry["expected_result"] == "BARREL"
+              assert file_sha256(repository_root / "examples" / entry["file"]) == entry["sha256"]
+          validate_detector_artifact_manifest(
+              Path(f"{csv_path}.manifest.json"), expected_output=csv_path
+          )
+          PY
+
+  package:
+    name: Build and clean-install artifacts
+    needs: [test, quality, dssp-integration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up locked uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked build environment
+        run: uv sync --locked --python 3.12 --extra dev
+
+      - name: Build and inspect distributions
+        run: |
+          build_constraints="${RUNNER_TEMP}/build-constraints.txt"
+          printf 'setuptools==%s\nwheel==%s\n' \
+            "${BUILD_SETUPTOOLS_VERSION}" \
+            "${BUILD_WHEEL_VERSION}" \
+            > "${build_constraints}"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          uv build --build-constraint "${build_constraints}"
+          .venv/bin/python -m twine check dist/*
+
+      - name: Smoke-test wheel in a clean environment
+        run: |
+          mapfile -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl' -print)
+          test "${#wheels[@]}" -eq 1
+          wheel_path="${wheels[0]}"
+          python -m venv "${RUNNER_TEMP}/wheel-venv"
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip install --disable-pip-version-check "${wheel_path}[full]"
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip check
+          "${RUNNER_TEMP}/wheel-venv/bin/cooper-beta" --version
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -c "from cooper_beta import build_config; c=build_config(); assert (c.rules.strand_adjacency_count.minimum, c.rules.cycle_strand_count_fraction.minimum_count, c.rules.cycle_strand_count_fraction.minimum_fraction, c.rules.cycle_rank.minimum) == (8, 4, 0.05, 1)"
+
+      - name: Smoke-test source distribution in a clean environment
+        run: |
+          mapfile -t sdists < <(find dist -maxdepth 1 -type f -name '*.tar.gz' -print)
+          test "${#sdists[@]}" -eq 1
+          sdist_path="${sdists[0]}"
+          python -m venv "${RUNNER_TEMP}/sdist-venv"
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pip install --disable-pip-version-check "${sdist_path}[full]"
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pip check
+          "${RUNNER_TEMP}/sdist-venv/bin/cooper-beta" --version
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -c "from cooper_beta.constants import DEFAULT_RESULT_COLUMNS; assert len(DEFAULT_RESULT_COLUMNS) == 14"
+
+      - name: Upload tested distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error

@@ -12,10 +12,18 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, TypedDict
 
 import numpy as np
-from Bio.PDB import MMCIFParser, PDBParser
+from Bio.PDB.Atom import Atom
+from Bio.PDB.Chain import Chain
+from Bio.PDB.MMCIFParser import MMCIFParser
+from Bio.PDB.Model import Model
+from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.Polypeptide import is_aa
+from Bio.PDB.Residue import Residue
+from Bio.PDB.Structure import Structure
+from numpy.typing import NDArray
 
 DEFAULT_CA_CUTOFF = 8.0
 DEFAULT_LOCAL_EXCLUSION = 2
@@ -40,6 +48,20 @@ class GeneratedContactMapSet:
     protid_list_path: str
     residue_mapping_path: str
     records: list[GeneratedContactMap]
+
+
+class ResidueMappingRow(TypedDict):
+    sample_id: str
+    matrix_index: int
+    source_file: str
+    chain_id: str
+    residue_name: str
+    residue_number: int
+    insertion_code: str
+
+
+class _StructureParser(Protocol):
+    def get_structure(self, structure_id: str, filename: str) -> Structure: ...
 
 
 def _safe_id(value: str) -> str:
@@ -94,40 +116,51 @@ def _decompress_gzip_to_temp_if_needed(path: Path) -> Path | None:
     return Path(temp_name)
 
 
-def _parse_structure(path: Path):
+def _parse_structure(path: Path) -> Structure:
     temp_path = _decompress_gzip_to_temp_if_needed(path)
     parse_path = temp_path or path
     extension = _structure_extension(parse_path)
-    parser = (
+    parser: _StructureParser = (
         MMCIFParser(QUIET=True)
         if extension in {".cif", ".mmcif"}
         else PDBParser(QUIET=True, PERMISSIVE=True, get_header=False)
     )
     try:
-        return parser.get_structure(_structure_stem(path), str(parse_path))
+        structure: Structure = parser.get_structure(_structure_stem(path), str(parse_path))
+        return structure
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
 
 
-def _chain_residues(chain) -> list[object]:
-    residues = []
-    for residue in chain.get_unpacked_list():
-        if is_aa(residue, standard=False) and "CA" in residue:
+def _chain_residues(chain: Chain) -> list[Residue]:
+    residues: list[Residue] = []
+    unpacked_residues: Iterable[Residue] = chain.get_unpacked_list()
+    for residue in unpacked_residues:
+        # Predicted structures can encode polymer residues as ATOM/UNK.  Their
+        # alpha-carbon trace is a valid input to this structure-only baseline.
+        # The blank hetero flag identifies ATOM polymer records; recognized
+        # modified amino acids remain accepted through Biopython's classifier.
+        is_polymer_atom = residue.id[0] == " "
+        if (is_polymer_atom or is_aa(residue, standard=False)) and "CA" in residue:
             residues.append(residue)
     return residues
 
 
 def _ca_contact_map(
-    residues: Sequence[object],
+    residues: Sequence[Residue],
     *,
     cutoff: float,
     local_exclusion: int,
-) -> np.ndarray:
-    coords = np.asarray([residue["CA"].coord for residue in residues], dtype=np.float32)
+) -> NDArray[np.float32]:
+    ca_coordinates: list[NDArray[np.float32]] = []
+    for residue in residues:
+        atom: Atom = residue["CA"]
+        ca_coordinates.append(atom.coord)
+    coords: NDArray[np.float32] = np.asarray(ca_coordinates, dtype=np.float32)
     deltas = coords[:, None, :] - coords[None, :, :]
     distances = np.linalg.norm(deltas, axis=-1)
-    contact_map = (distances <= cutoff).astype(np.float32)
+    contact_map: NDArray[np.float32] = (distances <= cutoff).astype(np.float32)
 
     if local_exclusion >= 0:
         for offset in range(-local_exclusion, local_exclusion + 1):
@@ -137,7 +170,7 @@ def _ca_contact_map(
 
 
 def _write_residue_mapping(
-    mapping_rows: Iterable[dict[str, object]],
+    mapping_rows: Iterable[ResidueMappingRow],
     residue_mapping_path: Path,
 ) -> None:
     fieldnames = [
@@ -170,18 +203,24 @@ def generate_structure_contact_maps(
     map_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[GeneratedContactMap] = []
-    mapping_rows: list[dict[str, object]] = []
+    mapping_rows: list[ResidueMappingRow] = []
     seen_ids: Counter[str] = Counter()
 
     for structure_path in discover_structure_files(structure_input):
         structure = _parse_structure(structure_path)
-        model = structure[0]
-        for chain in model.get_chains():
+        model: Model = structure[0]
+        chains: Iterable[Chain] = model.get_chains()
+        for chain in chains:
             residues = _chain_residues(chain)
             if len(residues) < min_residues:
                 continue
 
-            chain_id = str(chain.id).strip() or "blank"
+            chain_id = str(chain.id).strip()
+            if not chain_id:
+                raise ValueError(
+                    "Blank author chain identifiers cannot be represented unambiguously; "
+                    "IsItABarrel contact-map generation fails closed."
+                )
             base_id = f"{_structure_stem(structure_path)}_{_safe_id(chain_id)}"
             seen_ids[base_id] += 1
             sample_id = base_id if seen_ids[base_id] == 1 else f"{base_id}_{seen_ids[base_id]}"
@@ -208,7 +247,7 @@ def generate_structure_contact_maps(
             )
 
             for index, residue in enumerate(residues):
-                residue_id = residue.get_id()
+                residue_id: tuple[str, int, str] = residue.get_id()
                 insertion_code = str(residue_id[2]).strip()
                 mapping_rows.append(
                     {
@@ -216,7 +255,7 @@ def generate_structure_contact_maps(
                         "matrix_index": index,
                         "source_file": str(structure_path),
                         "chain_id": chain_id,
-                        "residue_name": residue.get_resname(),
+                        "residue_name": str(residue.get_resname()),
                         "residue_number": residue_id[1],
                         "insertion_code": insertion_code,
                     }
@@ -242,34 +281,49 @@ def generate_structure_contact_maps(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate structure-derived contact maps for the IsItABarrel adapter."
+        prog="python external_methods/isitabarrel/contact_maps.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Generate one alpha-carbon contact map per eligible protein chain for the "
+            "IsItABarrel adapter. PDB or mmCIF directories are searched recursively."
+        ),
+        epilog=(
+            "Output: <OUT_DIR>/maps/*.pkl, protid_list.tsv, and residue_mapping.csv. Chains "
+            "shorter than --min-residues alpha-carbon observations are omitted. Invalid arguments "
+            "exit with status 2; structure parsing or output failures exit nonzero."
+        ),
     )
-    parser.add_argument("structure_input", help="PDB/CIF/mmCIF file or directory.")
-    parser.add_argument("--out-dir", required=True, help="Directory for maps and metadata.")
+    parser.add_argument(
+        "structure_input",
+        metavar="STRUCTURE_OR_DIRECTORY",
+        help="PDB, CIF, or mmCIF file, or a directory searched recursively.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        required=True,
+        metavar="DIRECTORY",
+        help="Directory for contact-map pickle files and mapping metadata.",
+    )
     parser.add_argument(
         "--cutoff",
         type=float,
         default=DEFAULT_CA_CUTOFF,
-        help=f"CA-CA contact cutoff in Angstrom. Default: {DEFAULT_CA_CUTOFF}.",
+        metavar="ANGSTROMS",
+        help="Inclusive alpha-carbon distance cutoff used to define a contact.",
     )
     parser.add_argument(
         "--local-exclusion",
         type=int,
         default=DEFAULT_LOCAL_EXCLUSION,
-        help=(
-            "Zero contacts where sequence distance is <= this value. "
-            f"Default: {DEFAULT_LOCAL_EXCLUSION}."
-        ),
+        metavar="RESIDUES",
+        help="Set contacts to zero when sequence-index distance is at most this value.",
     )
     parser.add_argument(
         "--min-residues",
         type=int,
         default=DEFAULT_MIN_RESIDUES,
-        help=(
-            "Minimum CA residue count required for a chain. "
-            f"Default: {DEFAULT_MIN_RESIDUES}, which avoids an upstream "
-            "IsItABarrel indexing failure on very short chains."
-        ),
+        metavar="RESIDUES",
+        help="Minimum alpha-carbon residue count required to export a chain contact map.",
     )
     return parser
 

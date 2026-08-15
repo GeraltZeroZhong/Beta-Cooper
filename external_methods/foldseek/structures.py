@@ -11,9 +11,17 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, TypedDict
 
-from Bio.PDB import PDBIO, MMCIFParser, PDBParser, Select
+from Bio.PDB.Atom import Atom
+from Bio.PDB.Chain import Chain
+from Bio.PDB.MMCIFParser import MMCIFParser
+from Bio.PDB.Model import Model
+from Bio.PDB.PDBIO import PDBIO, Select
+from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.Polypeptide import is_aa
+from Bio.PDB.Residue import Residue
+from Bio.PDB.Structure import Structure
 
 DEFAULT_MIN_RESIDUES = 15
 SUPPORTED_EXTENSIONS = {".pdb", ".ent", ".cif", ".mmcif"}
@@ -37,11 +45,26 @@ class GeneratedStructureSet:
     records: list[GeneratedStructureChain]
 
 
-class _ProteinResidueSelect(Select):
-    def accept_residue(self, residue) -> int:
-        return 1 if is_aa(residue, standard=False) else 0
+class ResidueMappingRow(TypedDict):
+    sample_id: str
+    chain_file_index: int
+    source_file: str
+    source_chain_id: str
+    exported_chain_id: str
+    residue_name: str
+    residue_number: int
+    insertion_code: str
 
-    def accept_atom(self, atom) -> int:
+
+class _StructureParser(Protocol):
+    def get_structure(self, structure_id: str, filename: str) -> Structure: ...
+
+
+class _ProteinResidueSelect(Select):
+    def accept_residue(self, residue: Residue) -> int:
+        return 1 if _is_protein_backbone_residue(residue) else 0
+
+    def accept_atom(self, atom: Atom) -> int:
         return 1
 
 
@@ -97,32 +120,42 @@ def _decompress_gzip_to_temp_if_needed(path: Path) -> Path | None:
     return Path(temp_name)
 
 
-def _parse_structure(path: Path):
+def _parse_structure(path: Path) -> Structure:
     temp_path = _decompress_gzip_to_temp_if_needed(path)
     parse_path = temp_path or path
     extension = _structure_extension(parse_path)
-    parser = (
+    parser: _StructureParser = (
         MMCIFParser(QUIET=True)
         if extension in {".cif", ".mmcif"}
         else PDBParser(QUIET=True, PERMISSIVE=True, get_header=False)
     )
     try:
-        return parser.get_structure(_structure_stem(path), str(parse_path))
+        structure: Structure = parser.get_structure(_structure_stem(path), str(parse_path))
+        return structure
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
 
 
-def _chain_residues(chain) -> list[object]:
-    residues = []
-    for residue in chain.get_unpacked_list():
-        if is_aa(residue, standard=False) and "CA" in residue:
+def _chain_residues(chain: Chain) -> list[Residue]:
+    residues: list[Residue] = []
+    unpacked_residues: Iterable[Residue] = chain.get_unpacked_list()
+    for residue in unpacked_residues:
+        if _is_protein_backbone_residue(residue):
             residues.append(residue)
     return residues
 
 
-def _write_chain_pdb(chain, chain_path: Path) -> None:
-    chain_copy = chain.copy()
+def _is_protein_backbone_residue(residue: Residue) -> bool:
+    """Accept named amino acids and declared unknown residues with complete backbone."""
+
+    return is_aa(residue, standard=False) or all(
+        atom_name in residue for atom_name in ("N", "CA", "C")
+    )
+
+
+def _write_chain_pdb(chain: Chain, chain_path: Path) -> None:
+    chain_copy: Chain = chain.copy()
     chain_copy.id = "A"
     chain_path.parent.mkdir(parents=True, exist_ok=True)
     io = PDBIO()
@@ -148,7 +181,7 @@ def _write_manifest(records: Iterable[GeneratedStructureChain], manifest_path: P
 
 
 def _write_residue_mapping(
-    mapping_rows: Iterable[dict[str, object]],
+    mapping_rows: Iterable[ResidueMappingRow],
     residue_mapping_path: Path,
 ) -> None:
     fieldnames = [
@@ -196,18 +229,24 @@ def generate_structure_chains(
     chain_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[GeneratedStructureChain] = []
-    mapping_rows: list[dict[str, object]] = []
+    mapping_rows: list[ResidueMappingRow] = []
     seen_ids: Counter[str] = Counter()
 
     for structure_path in discover_structure_files(structure_input):
         structure = _parse_structure(structure_path)
-        model = structure[0]
-        for chain in model.get_chains():
+        model: Model = structure[0]
+        chains: Iterable[Chain] = model.get_chains()
+        for chain in chains:
             residues = _chain_residues(chain)
             if len(residues) < min_residues:
                 continue
 
-            chain_id = str(chain.id).strip() or "blank"
+            chain_id = str(chain.id).strip()
+            if not chain_id:
+                raise ValueError(
+                    "Blank author chain identifiers cannot be represented unambiguously; "
+                    "Foldseek chain generation fails closed."
+                )
             base_id = f"{_structure_stem(structure_path)}_{_safe_id(chain_id)}"
             seen_ids[base_id] += 1
             sample_id = base_id if seen_ids[base_id] == 1 else f"{base_id}_{seen_ids[base_id]}"
@@ -225,7 +264,7 @@ def generate_structure_chains(
             )
 
             for index, residue in enumerate(residues):
-                residue_id = residue.get_id()
+                residue_id: tuple[str, int, str] = residue.get_id()
                 insertion_code = str(residue_id[2]).strip()
                 mapping_rows.append(
                     {
@@ -234,7 +273,7 @@ def generate_structure_chains(
                         "source_file": str(structure_path),
                         "source_chain_id": chain_id,
                         "exported_chain_id": "A",
-                        "residue_name": residue.get_resname(),
+                        "residue_name": str(residue.get_resname()),
                         "residue_number": residue_id[1],
                         "insertion_code": insertion_code,
                     }
@@ -257,15 +296,35 @@ def generate_structure_chains(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate chain-level structure inputs for the Foldseek adapter."
+        prog="python external_methods/foldseek/structures.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Extract every eligible protein chain from PDB or mmCIF input as a separate PDB "
+            "query for the Foldseek adapter. Directory inputs are searched recursively."
+        ),
+        epilog=(
+            "Output: <OUT_DIR>/chains/*.pdb, chain_manifest.csv, and residue_mapping.csv. "
+            "Chains shorter than --min-residues alpha-carbon observations are omitted. Invalid "
+            "arguments exit with status 2; structure parsing or output failures exit nonzero."
+        ),
     )
-    parser.add_argument("structure_input", help="PDB/CIF/mmCIF file or directory.")
-    parser.add_argument("--out-dir", required=True, help="Directory for chain files and metadata.")
+    parser.add_argument(
+        "structure_input",
+        metavar="STRUCTURE_OR_DIRECTORY",
+        help="PDB, CIF, or mmCIF file, or a directory searched recursively.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        required=True,
+        metavar="DIRECTORY",
+        help="Directory for generated chain PDB files and mapping metadata.",
+    )
     parser.add_argument(
         "--min-residues",
         type=int,
         default=DEFAULT_MIN_RESIDUES,
-        help=f"Minimum CA residue count required for a chain. Default: {DEFAULT_MIN_RESIDUES}.",
+        metavar="RESIDUES",
+        help="Minimum alpha-carbon residue count required to export a chain.",
     )
     return parser
 

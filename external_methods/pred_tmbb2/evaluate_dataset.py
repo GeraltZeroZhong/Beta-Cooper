@@ -1,17 +1,40 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import math
+import re
 import sys
-from collections import Counter, defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from external_methods.evaluation_common import (
+    FILE_FIELDS,
+    SUMMARY_FIELDS,
+    apply_target_chain_labels,
+    atomic_write_csv,
+    atomic_write_text,
+    checkout_identity,
+    complete_manifest,
+    executable_identity,
+    fail_manifest,
+    file_rows_from_chain_rows,
+    file_state,
+    files_inventory,
+    fresh_run_directory,
+    initialize_manifest,
+    read_target_manifest,
+    summary_markdown,
+    summary_rows,
+    update_running_manifest,
+    validate_disjoint_labeled_inventories,
+    validate_generated_source_coverage,
+    validate_metric_contract,
+    validate_prediction_rows,
+)
 from external_methods.pred_tmbb2.runner import (
     DEFAULT_MIN_TM_STRANDS,
     DEFAULT_PREDICTION_FIELD,
@@ -22,44 +45,51 @@ from external_methods.pred_tmbb2.sequences import (
     DEFAULT_MIN_RESIDUES,
     GeneratedFastaSet,
     GeneratedSequence,
+    discover_structure_files,
     generate_structure_fasta,
 )
 
 BASELINE_NAME = "pred_tmbb2_single_juchmme"
-RAW_CHAIN_FIELDS = [
-    "filename",
-    "chain",
+DEFAULT_METRIC_LEVEL = "file"
+NORMALIZED_FIELDS = [
+    "baseline",
+    "sample_id",
     "result",
-    "result_stage",
+    "score",
+    "tm_strands",
+    "decision_rule",
+    "prediction_field",
+    "reliability",
+    "algorithm_score",
+    "length",
+    "logodds",
+    "max_prob",
+    "neg_logprob_per_length",
+    "topology",
+]
+CHAIN_FIELDS = [
+    "filename",
+    "relative_path",
+    "author_chain_id",
+    "source_file",
+    "sample_id",
+    "baseline",
+    "result",
+    "pred_barrel",
     "decision_score",
-    "decision_basis",
     "decision_threshold",
-    "score_raw",
-    "score_adjust",
-    "valid_layers",
-    "scored_layers",
-    "total_layers",
-    "valid_layer_frac",
-    "scored_layer_frac",
-    "junk_layers",
-    "invalid_layers",
-    "avg_radius",
-    "chain_residues",
-    "sheet_residues",
-    "informative_slices",
-    "reason",
-    "all_adjusted_layers",
-    "all_layers",
-    "y_true",
-    "split",
+    "chain_residue_count",
+    "sequence_sha256",
+    "sequence_source",
+    "polymer_entity_id",
+    "label_asym_id",
     "is_error",
     "is_filtered_out",
     "is_skip",
-    "pred_barrel",
+    "is_target_author_chain",
     "use_for_metrics",
-    "sample_id",
-    "baseline",
-    "source_file",
+    "y_true",
+    "split",
     "pdb_id",
     "tm_strands",
     "prediction_field",
@@ -70,134 +100,97 @@ RAW_CHAIN_FIELDS = [
     "max_prob",
     "neg_logprob_per_length",
     "topology",
-    "original_split",
-]
-MANUAL_EXTRA_FIELDS = [
-    "final_split",
-    "include_for_metrics",
-    "policy",
-    "manual_label_reason",
-]
-MANUAL_REQUIRED_FIELDS = {
-    "filename",
-    "final_split",
-    "include_for_metrics",
-    "policy",
-    "reason",
-}
-MANUAL_FINAL_SPLITS = {"positive", "negative"}
-MANUAL_TRUE_VALUES = {"true", "1", "yes", "y"}
-MANUAL_FALSE_VALUES = {"false", "0", "no", "n"}
-FILE_FIELDS = [
-    "split",
-    "y_true",
-    "file_id",
-    "filename",
-    "source_file",
-    "decision_score_max",
-    "score_adjust_max",
-    "pred_barrel_any",
-    "any_filtered_out",
-    "any_skip",
-    "chains_n",
-]
-SUMMARY_FIELDS = [
-    "scope",
-    "level",
-    "n_used",
-    "TP",
-    "FP",
-    "TN",
-    "FN",
-    "recall",
-    "precision",
-    "f1",
-    "specificity",
-    "accuracy",
-    "balanced_accuracy",
-    "mcc",
 ]
 
 
 @dataclass(frozen=True)
 class SplitRun:
     split_name: str
-    y_true: int
     generated: GeneratedFastaSet
     results: list[PredTmbb2Result]
 
 
-def _read_csv(path: Path) -> list[dict[str, str]]:
-    with path.open(newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
-
-
-def _write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[dict[str, object]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-
 def _pdb_id_from_filename(filename: str) -> str:
-    stem = Path(filename).stem
-    return stem.split("_", 1)[0].upper()
+    return Path(filename).stem.split("_", 1)[0].upper()
 
 
 def _metadata_by_sample(generated: GeneratedFastaSet) -> dict[str, GeneratedSequence]:
-    return {record.sample_id: record for record in generated.records}
+    metadata = {record.sample_id: record for record in generated.records}
+    if len(metadata) != len(generated.records):
+        raise ValueError("Generated PRED-TMBB2 sequences contain duplicate sample IDs.")
+    return metadata
 
 
-def _chain_rows_for_split(run: SplitRun) -> list[dict[str, object]]:
+def _chain_rows_for_split(
+    run: SplitRun,
+    *,
+    min_tm_strands: int = DEFAULT_MIN_TM_STRANDS,
+) -> list[dict[str, object]]:
     metadata = _metadata_by_sample(run.generated)
-    rows: list[dict[str, object]] = []
     result_by_sample = {result.sample_id: result for result in run.results}
+    if len(result_by_sample) != len(run.results):
+        raise ValueError("PRED-TMBB2 returned duplicate sample IDs.")
     missing_samples = sorted(set(metadata) - set(result_by_sample))
-    if missing_samples:
-        preview = ", ".join(missing_samples[:10])
-        suffix = " ..." if len(missing_samples) > 10 else ""
-        raise ValueError(f"PRED-TMBB2 did not return results for sample(s): {preview}{suffix}")
+    unexpected_samples = sorted(set(result_by_sample) - set(metadata))
+    if missing_samples or unexpected_samples:
+        raise ValueError(
+            "PRED-TMBB2 result identity does not match generated queries; "
+            f"missing={missing_samples[:10]!r}, unexpected={unexpected_samples[:10]!r}."
+        )
+
+    rows: list[dict[str, object]] = []
     for sample_id, record in metadata.items():
         result = result_by_sample[sample_id]
+        if result.result in {"BARREL", "NON_BARREL"}:
+            if result.length is None or result.length != record.n_residues:
+                raise ValueError(
+                    f"PRED-TMBB2 output length for {sample_id!r} must equal the declared "
+                    f"complete polymer-sequence length {record.n_residues}; observed "
+                    f"{result.length!r}."
+                )
+            if len(result.topology) != record.n_residues:
+                raise ValueError(
+                    f"PRED-TMBB2 topology length for {sample_id!r} must equal the declared "
+                    f"complete polymer-sequence length {record.n_residues}; observed "
+                    f"{len(result.topology)}."
+                )
+            counted_strands = len(re.findall(r"M+", result.topology.upper()))
+            if result.tm_strands != counted_strands or result.score != float(counted_strands):
+                raise ValueError(
+                    f"PRED-TMBB2 normalized strand count/score for {sample_id!r} is "
+                    "inconsistent with its topology string."
+                )
+            expected_result = "BARREL" if counted_strands >= min_tm_strands else "NON_BARREL"
+            if result.result != expected_result:
+                raise ValueError(
+                    f"PRED-TMBB2 result for {sample_id!r} is inconsistent with the frozen "
+                    f"minimum-strand rule ({min_tm_strands})."
+                )
         filename = Path(record.source_path).name
-        pred_barrel = result.result == "BARREL"
         rows.append(
             {
                 "filename": filename,
-                "chain": record.chain_id,
+                "relative_path": "",
+                "author_chain_id": record.author_chain_id,
                 "result": result.result,
-                "result_stage": BASELINE_NAME,
+                "pred_barrel": result.result == "BARREL",
                 "decision_score": result.score,
-                "decision_basis": result.decision_rule,
-                "decision_threshold": DEFAULT_MIN_TM_STRANDS,
-                "score_raw": result.score,
-                "score_adjust": result.score,
-                "valid_layers": 0,
-                "scored_layers": result.tm_strands,
-                "total_layers": 0,
-                "valid_layer_frac": 0.0,
-                "scored_layer_frac": 0.0,
-                "junk_layers": 0,
-                "invalid_layers": 0,
-                "avg_radius": 0.0,
-                "chain_residues": record.n_residues,
-                "sheet_residues": 0,
-                "informative_slices": result.tm_strands,
-                "reason": result.decision_rule,
-                "all_adjusted_layers": "",
-                "all_layers": "",
-                "y_true": run.y_true,
-                "split": "true" if run.y_true == 1 else "false",
+                "decision_threshold": min_tm_strands,
+                "chain_residue_count": record.n_residues,
+                "sequence_sha256": record.sequence_sha256,
+                "sequence_source": record.sequence_source,
+                "polymer_entity_id": record.polymer_entity_id,
+                "label_asym_id": record.label_asym_id,
+                "y_true": "",
+                "split": "",
                 "is_error": False,
                 "is_filtered_out": False,
                 "is_skip": False,
-                "pred_barrel": pred_barrel,
-                "use_for_metrics": True,
+                "use_for_metrics": False,
+                "is_target_author_chain": False,
                 "sample_id": result.sample_id,
                 "baseline": BASELINE_NAME,
-                "source_file": record.source_path,
+                "source_file": str(Path(record.source_path).resolve()),
                 "pdb_id": _pdb_id_from_filename(filename),
                 "tm_strands": result.tm_strands,
                 "prediction_field": result.prediction_field,
@@ -208,381 +201,406 @@ def _chain_rows_for_split(run: SplitRun) -> list[dict[str, object]]:
                 "max_prob": result.max_prob,
                 "neg_logprob_per_length": result.neg_logprob_per_length,
                 "topology": result.topology,
-                "original_split": run.split_name,
             }
         )
+    validate_prediction_rows(rows)
     return rows
 
 
-def _file_rows_from_chain_rows(rows: Sequence[dict[str, object]]) -> list[dict[str, object]]:
-    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
-    for row in rows:
-        if row.get("use_for_metrics") is False:
-            continue
-        file_id = str(row.get("source_file") or row["filename"])
-        grouped[file_id].append(row)
-
-    file_rows: list[dict[str, object]] = []
-    for file_id in sorted(grouped):
-        group = grouped[file_id]
-        decision_scores = [float(row["decision_score"]) for row in group]
-        score_adjusts = [float(row["score_adjust"]) for row in group]
-        pred_any = any(bool(row["pred_barrel"]) for row in group)
-        y_true = int(group[0]["y_true"])
-        file_rows.append(
-            {
-                "split": "true" if y_true == 1 else "false",
-                "y_true": y_true,
-                "file_id": file_id,
-                "filename": str(group[0]["filename"]),
-                "source_file": str(group[0].get("source_file", "")),
-                "decision_score_max": max(decision_scores) if decision_scores else 0.0,
-                "score_adjust_max": max(score_adjusts) if score_adjusts else 0.0,
-                "pred_barrel_any": pred_any,
-                "any_filtered_out": any(bool(row["is_filtered_out"]) for row in group),
-                "any_skip": any(bool(row["is_skip"]) for row in group),
-                "chains_n": len(group),
-            }
-        )
-    return file_rows
-
-
-def _boolish(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"true", "1", "yes"}
-
-
-def _parse_manual_bool(value: object, *, filename: str) -> bool:
-    normalized = str(value).strip().lower()
-    if normalized in MANUAL_TRUE_VALUES:
-        return True
-    if normalized in MANUAL_FALSE_VALUES:
-        return False
-    raise ValueError(
-        f"Manual manifest row for {filename!r} has invalid include_for_metrics={value!r}."
-    )
-
-
-def _manual_annotations(path: Path | None) -> dict[str, dict[str, object]]:
-    if path is None:
-        return {}
-    annotations: dict[str, dict[str, object]] = {}
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        missing = MANUAL_REQUIRED_FIELDS - set(reader.fieldnames or [])
-        if missing:
-            joined = ", ".join(sorted(missing))
-            raise ValueError(f"Manual manifest is missing required column(s): {joined}")
-        for line_number, row in enumerate(reader, start=2):
-            filename = str(row.get("filename", "")).strip()
-            if not filename:
-                raise ValueError(f"Manual manifest row {line_number} has an empty filename.")
-            if filename in annotations:
-                raise ValueError(f"Manual manifest contains duplicate filename: {filename}")
-            include = _parse_manual_bool(row.get("include_for_metrics"), filename=filename)
-            final_split = str(row.get("final_split", "")).strip().lower()
-            if final_split and final_split not in MANUAL_FINAL_SPLITS:
-                raise ValueError(
-                    f"Manual manifest row for {filename!r} has invalid final_split={final_split!r}."
-                )
-            if include and final_split not in MANUAL_FINAL_SPLITS:
-                raise ValueError(
-                    f"Manual manifest row for {filename!r} must set final_split to "
-                    "'positive' or 'negative' when include_for_metrics is true."
-                )
-            annotations[filename] = {
-                "filename": filename,
-                "final_split": final_split,
-                "include_for_metrics": include,
-                "policy": str(row.get("policy", "")).strip(),
-                "reason": str(row.get("reason", "")).strip(),
-            }
-    return annotations
-
-
-def _apply_manual_annotations(
-    chain_rows: Sequence[dict[str, object]],
-    annotations: dict[str, dict[str, object]],
-) -> list[dict[str, object]]:
-    reviewed: list[dict[str, object]] = []
-    for row in chain_rows:
-        filename = str(row["filename"])
-        file_id = str(row.get("source_file", "") or filename)
-        annotation = annotations.get(file_id) or annotations.get(filename)
-        if annotation is None:
-            final_split = str(row["original_split"])
-            include = True
-            policy = "keep_original_label"
-            reason = "no explicit correction in manual notes"
-        else:
-            include = bool(annotation["include_for_metrics"])
-            policy = str(annotation["policy"])
-            reason = str(annotation["reason"])
-            final_split = str(annotation["final_split"])
-
-        updated = dict(row)
-        updated["final_split"] = final_split
-        updated["include_for_metrics"] = include
-        updated["policy"] = policy
-        updated["manual_label_reason"] = reason
-        updated["use_for_metrics"] = include
-        if final_split == "positive":
-            updated["y_true"] = 1
-            updated["split"] = "true"
-        elif final_split == "negative":
-            updated["y_true"] = 0
-            updated["split"] = "false"
-        else:
-            updated["y_true"] = ""
-            updated["split"] = final_split
-        if include:
-            reviewed.append(updated)
-    return reviewed
-
-
-def _with_manual_file_columns(
-    file_rows: Sequence[dict[str, object]],
-    annotations: dict[str, dict[str, object]],
-) -> list[dict[str, object]]:
-    reviewed: list[dict[str, object]] = []
-    for row in file_rows:
-        filename = str(row["filename"])
-        file_id = str(row.get("file_id", "") or row.get("source_file", "") or filename)
-        annotation = annotations.get(file_id) or annotations.get(filename)
-        if annotation is None:
-            include = True
-            final_split = "positive" if int(row["y_true"]) == 1 else "negative"
-            policy = "keep_original_label"
-            reason = "no explicit correction in manual notes"
-        else:
-            include = bool(annotation["include_for_metrics"])
-            final_split = str(annotation["final_split"])
-            policy = str(annotation["policy"])
-            reason = str(annotation["reason"])
-        if not include:
-            continue
-        updated = dict(row)
-        updated["final_split"] = final_split
-        updated["include_for_metrics"] = include
-        updated["policy"] = policy
-        updated["manual_label_reason"] = reason
-        if final_split == "positive":
-            updated["y_true"] = 1
-            updated["split"] = "true"
-        elif final_split == "negative":
-            updated["y_true"] = 0
-            updated["split"] = "false"
-        reviewed.append(updated)
-    return reviewed
-
-
-def _metrics(rows: Sequence[dict[str, object]], *, file_level: bool) -> dict[str, object]:
-    tp = fp = tn = fn = 0
-    for row in rows:
-        y_true = int(row["y_true"])
-        pred = _boolish(row["pred_barrel_any"] if file_level else row["pred_barrel"])
-        if y_true == 1 and pred:
-            tp += 1
-        elif y_true == 0 and pred:
-            fp += 1
-        elif y_true == 0 and not pred:
-            tn += 1
-        elif y_true == 1 and not pred:
-            fn += 1
-
-    recall = tp / (tp + fn) if tp + fn else math.nan
-    precision = tp / (tp + fp) if tp + fp else math.nan
-    specificity = tn / (tn + fp) if tn + fp else math.nan
-    accuracy = (tp + tn) / (tp + fp + tn + fn) if tp + fp + tn + fn else math.nan
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else math.nan
-    balanced_accuracy = (
-        (recall + specificity) / 2
-        if not math.isnan(recall) and not math.isnan(specificity)
-        else math.nan
-    )
-    denom = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
-    mcc = ((tp * tn) - (fp * fn)) / denom if denom else math.nan
-
-    return {
-        "n_used": tp + fp + tn + fn,
-        "TP": tp,
-        "FP": fp,
-        "TN": tn,
-        "FN": fn,
-        "recall": recall,
-        "precision": precision,
-        "f1": f1,
-        "specificity": specificity,
-        "accuracy": accuracy,
-        "balanced_accuracy": balanced_accuracy,
-        "mcc": mcc,
-    }
-
-
-def _summary_rows(
-    raw_chain_rows: Sequence[dict[str, object]],
-    raw_file_rows: Sequence[dict[str, object]],
-    reviewed_chain_rows: Sequence[dict[str, object]],
-    reviewed_file_rows: Sequence[dict[str, object]],
-) -> list[dict[str, object]]:
-    cases = [
-        ("raw", "chain", raw_chain_rows, False),
-        ("raw", "file", raw_file_rows, True),
-        ("manual_reviewed", "chain", reviewed_chain_rows, False),
-        ("manual_reviewed", "file", reviewed_file_rows, True),
-    ]
-    output = []
-    for scope, level, rows, file_level in cases:
-        row = {"scope": scope, "level": level}
-        row.update(_metrics(rows, file_level=file_level))
-        output.append(row)
-    return output
-
-
-def _write_summary_md(path: Path, summary_rows: Sequence[dict[str, object]]) -> None:
-    headers = SUMMARY_FIELDS
-    lines = [
-        "| " + " | ".join(headers) + " |",
-        "| " + " | ".join(["---"] * len(headers)) + " |",
-    ]
-    for row in summary_rows:
-        lines.append("| " + " | ".join(str(row.get(header, "")) for header in headers) + " |")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def _validate_parameters(
+    *,
+    min_residues: int,
+    prediction_field: str,
+    min_tm_strands: int,
+    timeout: float | None,
+) -> None:
+    if isinstance(min_residues, bool) or not isinstance(min_residues, int) or min_residues <= 0:
+        raise ValueError("min_residues must be a positive integer.")
+    if prediction_field not in {"LP", "VP"}:
+        raise ValueError("prediction_field must be LP or VP.")
+    if (
+        isinstance(min_tm_strands, bool)
+        or not isinstance(min_tm_strands, int)
+        or min_tm_strands <= 0
+    ):
+        raise ValueError("min_tm_strands must be a positive integer.")
+    if timeout is not None and (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(float(timeout))
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be finite and > 0 when provided.")
 
 
 def run_dataset(
     positive_dir: Path,
     negative_dir: Path,
-    output_dir: Path,
+    output_root: Path,
     *,
     juchmme_dir: Path,
-    manual_manifest: Path | None,
+    positive_target_manifest: Path | None,
+    negative_target_manifest: Path | None,
+    metric_level: str,
     min_residues: int,
     prediction_field: str,
     min_tm_strands: int,
     java_executable: str,
     timeout: float | None,
     tag: str,
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    split_runs: list[SplitRun] = []
-    for split_name, y_true, input_dir in [
-        ("positive", 1, positive_dir),
-        ("negative", 0, negative_dir),
-    ]:
-        split_output = output_dir / split_name
-        generated = generate_structure_fasta(
-            input_dir,
-            split_output,
+) -> Path:
+    supplied_parameters = {
+        "positive_dir": str(positive_dir),
+        "negative_dir": str(negative_dir),
+        "output_root": str(output_root),
+        "juchmme_dir": str(juchmme_dir),
+        "positive_target_manifest": (
+            str(positive_target_manifest) if positive_target_manifest is not None else None
+        ),
+        "negative_target_manifest": (
+            str(negative_target_manifest) if negative_target_manifest is not None else None
+        ),
+        "metric_level": metric_level,
+        "min_residues": min_residues,
+        "prediction_field": prediction_field,
+        "min_tm_strands": min_tm_strands,
+        "java_executable": java_executable,
+        "timeout": timeout,
+        "tag": tag,
+    }
+    run_dir = fresh_run_directory(output_root, baseline=BASELINE_NAME, tag=tag)
+    manifest_path = run_dir / "evaluation_manifest.json"
+    manifest = initialize_manifest(
+        manifest_path,
+        baseline=BASELINE_NAME,
+        script_path=Path(__file__),
+        supplied_parameters=supplied_parameters,
+    )
+    phase = "validation"
+    try:
+        update_running_manifest(manifest_path, manifest, phase=phase)
+        validate_metric_contract(metric_level, positive_target_manifest, negative_target_manifest)
+        normalized_prediction_field = str(prediction_field).upper()
+        _validate_parameters(
             min_residues=min_residues,
-        )
-        results = run_baseline(
-            generated.fasta_path,
-            juchmme_dir=juchmme_dir,
-            work_dir=split_output / "juchmme_work",
-            output_path=split_output / "normalized.csv",
-            prediction_field=prediction_field,
+            prediction_field=normalized_prediction_field,
             min_tm_strands=min_tm_strands,
-            java_executable=java_executable,
             timeout=timeout,
         )
-        split_runs.append(SplitRun(split_name, y_true, generated, results))
+        roots = {
+            "positive": positive_dir.expanduser().resolve(),
+            "negative": negative_dir.expanduser().resolve(),
+        }
+        for label, root in roots.items():
+            if not root.is_dir():
+                raise NotADirectoryError(f"{label} input must be a directory: {root}")
+        structure_files = {split: discover_structure_files(root) for split, root in roots.items()}
+        inventories = {
+            split: files_inventory(files, root=roots[split])
+            for split, files in structure_files.items()
+        }
+        validate_disjoint_labeled_inventories(inventories["positive"], inventories["negative"])
+        target_states = {
+            "positive": (
+                file_state(positive_target_manifest)
+                if positive_target_manifest is not None
+                else None
+            ),
+            "negative": (
+                file_state(negative_target_manifest)
+                if negative_target_manifest is not None
+                else None
+            ),
+        }
+        targets = {
+            "positive": (
+                read_target_manifest(
+                    positive_target_manifest,
+                    split_root=roots["positive"],
+                    structure_files=structure_files["positive"],
+                )
+                if positive_target_manifest is not None
+                else None
+            ),
+            "negative": (
+                read_target_manifest(
+                    negative_target_manifest,
+                    split_root=roots["negative"],
+                    structure_files=structure_files["negative"],
+                )
+                if negative_target_manifest is not None
+                else None
+            ),
+        }
+        java_identity = executable_identity(java_executable)
+        checkout_state = checkout_identity(juchmme_dir)
+        manifest["parameters"] = {
+            **supplied_parameters,
+            "positive_dir": str(roots["positive"]),
+            "negative_dir": str(roots["negative"]),
+            "juchmme_dir": checkout_state["path"],
+            "java_executable": java_identity["path"],
+            "prediction_field": normalized_prediction_field,
+            "filtered_out_policy": "strict",
+            "sequence_identity_schema": (
+                "declared_complete_polymer_sequence_exact_author_chain_mapping"
+            ),
+        }
+        code_dependencies = {
+            "evaluation_common": file_state(
+                Path(__file__).resolve().parents[1] / "evaluation_common.py"
+            ),
+            "runner": file_state(Path(__file__).with_name("runner.py")),
+            "sequences": file_state(Path(__file__).with_name("sequences.py")),
+        }
+        manifest["code_dependencies"] = code_dependencies
+        manifest["inputs"] = {
+            "structure_inventories": inventories,
+            "target_chain_manifests": target_states,
+        }
+        manifest["external_software"] = {
+            "java": java_identity,
+            "juchmme_checkout": checkout_state,
+        }
+        manifest["metric_sampling"] = {
+            "file": "one_directory_labeled_structure_file_any_chain_prediction",
+            "chain": (
+                "one_manifest_target_chain_per_positive_and_negative_file"
+                if targets["positive"] is not None
+                else None
+            ),
+            "partner_chain_labels": "unlabeled",
+            "error_policy": "fail_closed",
+            "filtered_out_policy": "strict",
+            "sequence_input": "pdb_seqres_or_complete_mmcif_entity_poly_seq",
+        }
+        phase = "input_preparation"
+        update_running_manifest(manifest_path, manifest, phase=phase)
 
-    raw_chain_rows = [row for split_run in split_runs for row in _chain_rows_for_split(split_run)]
-    raw_file_rows = _file_rows_from_chain_rows(raw_chain_rows)
-    annotations = _manual_annotations(manual_manifest)
-    reviewed_chain_rows = _apply_manual_annotations(raw_chain_rows, annotations)
-    reviewed_file_rows = _with_manual_file_columns(
-        _file_rows_from_chain_rows(reviewed_chain_rows),
-        annotations,
-    )
-    summary_rows = _summary_rows(
-        raw_chain_rows,
-        raw_file_rows,
-        reviewed_chain_rows,
-        reviewed_file_rows,
-    )
+        split_runs: list[SplitRun] = []
+        for split_name in ("positive", "negative"):
+            phase = f"external_run_{split_name}"
+            update_running_manifest(manifest_path, manifest, phase=phase)
+            split_output = run_dir / split_name
+            generated = generate_structure_fasta(
+                roots[split_name], split_output, min_residues=min_residues
+            )
+            validate_generated_source_coverage(
+                [record.source_path for record in generated.records],
+                structure_files=structure_files[split_name],
+                context=split_name,
+            )
+            results = run_baseline(
+                generated.fasta_path,
+                juchmme_dir=Path(str(checkout_state["path"])),
+                work_dir=split_output / "juchmme_work",
+                output_path=None,
+                prediction_field=normalized_prediction_field,
+                min_tm_strands=min_tm_strands,
+                java_executable=str(java_identity["path"]),
+                timeout=timeout,
+            )
+            atomic_write_csv(
+                split_output / "normalized.csv",
+                NORMALIZED_FIELDS,
+                [result.as_row() for result in results],
+            )
+            split_runs.append(SplitRun(split_name, generated, results))
 
-    _write_csv(
-        output_dir / f"eval_chain_results_{tag}_raw.csv",
-        RAW_CHAIN_FIELDS,
-        raw_chain_rows,
-    )
-    _write_csv(
-        output_dir / f"eval_file_results_{tag}_raw.csv",
-        FILE_FIELDS,
-        raw_file_rows,
-    )
-    _write_csv(
-        output_dir / f"eval_chain_results_{tag}_manual_reviewed.csv",
-        [*RAW_CHAIN_FIELDS, *MANUAL_EXTRA_FIELDS],
-        reviewed_chain_rows,
-    )
-    _write_csv(
-        output_dir / f"eval_file_results_{tag}_manual_reviewed.csv",
-        [*FILE_FIELDS, *MANUAL_EXTRA_FIELDS],
-        reviewed_file_rows,
-    )
-    _write_csv(
-        output_dir / f"{BASELINE_NAME}_summary_{tag}.csv",
-        SUMMARY_FIELDS,
-        summary_rows,
-    )
-    _write_summary_md(output_dir / f"{BASELINE_NAME}_summary_{tag}.md", summary_rows)
+        phase = "metric_construction"
+        update_running_manifest(manifest_path, manifest, phase=phase)
+        all_predictions: list[dict[str, object]] = []
+        all_target_rows: list[dict[str, object]] = []
+        all_file_rows: list[dict[str, object]] = []
+        for split_run in split_runs:
+            raw_rows = _chain_rows_for_split(split_run, min_tm_strands=min_tm_strands)
+            predictions, target_rows = apply_target_chain_labels(
+                raw_rows,
+                split=split_run.split_name,
+                split_root=roots[split_run.split_name],
+                targets=targets[split_run.split_name],
+            )
+            all_predictions.extend(predictions)
+            all_target_rows.extend(target_rows)
+            all_file_rows.extend(
+                file_rows_from_chain_rows(
+                    raw_rows,
+                    split=split_run.split_name,
+                    split_root=roots[split_run.split_name],
+                    structure_files=structure_files[split_run.split_name],
+                )
+            )
+        metric_rows = summary_rows(
+            metric_level=metric_level,
+            file_rows=all_file_rows,
+            target_chain_rows=all_target_rows,
+        )
 
-    print(f"Raw chain rows: {len(raw_chain_rows)}")
-    print(f"Raw file rows: {len(raw_file_rows)}")
-    print(f"Manual-reviewed chain rows: {len(reviewed_chain_rows)}")
-    print(f"Manual-reviewed file rows: {len(reviewed_file_rows)}")
-    print("Raw chain result counts:", Counter(row["result"] for row in raw_chain_rows))
-    print(
-        "Manual file final split counts:",
-        Counter(row["final_split"] for row in reviewed_file_rows),
-    )
-    print(f"Output directory: {output_dir.resolve()}")
+        phase = "output_writing"
+        update_running_manifest(manifest_path, manifest, phase=phase)
+        atomic_write_csv(run_dir / "chain_predictions.csv", CHAIN_FIELDS, all_predictions)
+        atomic_write_csv(run_dir / "file_results.csv", FILE_FIELDS, all_file_rows)
+        if metric_level in {"chain", "both"}:
+            atomic_write_csv(run_dir / "target_chain_results.csv", CHAIN_FIELDS, all_target_rows)
+        atomic_write_csv(run_dir / "summary.csv", SUMMARY_FIELDS, metric_rows)
+        atomic_write_text(run_dir / "summary.md", summary_markdown(metric_rows))
+
+        phase = "provenance_verification"
+        update_running_manifest(manifest_path, manifest, phase=phase)
+        current_inventories = {
+            split: files_inventory(files, root=roots[split])
+            for split, files in structure_files.items()
+        }
+        if current_inventories != inventories:
+            raise RuntimeError("A structure input changed during PRED-TMBB2 evaluation.")
+        for split in ("positive", "negative"):
+            state = target_states[split]
+            if state is not None and file_state(Path(state["path"])) != state:
+                raise RuntimeError(f"The {split} target-chain manifest changed during evaluation.")
+        if executable_identity(Path(str(java_identity["path"]))) != java_identity:
+            raise RuntimeError("The Java executable changed during evaluation.")
+        if checkout_identity(Path(str(checkout_state["path"]))) != checkout_state:
+            raise RuntimeError("The JUCHMME checkout changed during evaluation.")
+        if file_state(Path(__file__)) != manifest["script"]:
+            raise RuntimeError("The PRED-TMBB2 evaluator script changed during evaluation.")
+        current_code_dependencies = {
+            "evaluation_common": file_state(
+                Path(__file__).resolve().parents[1] / "evaluation_common.py"
+            ),
+            "runner": file_state(Path(__file__).with_name("runner.py")),
+            "sequences": file_state(Path(__file__).with_name("sequences.py")),
+        }
+        if current_code_dependencies != code_dependencies:
+            raise RuntimeError("A PRED-TMBB2 evaluator code dependency changed during evaluation.")
+        complete_manifest(manifest_path, manifest)
+    except Exception as exc:
+        fail_manifest(manifest_path, manifest, phase=phase, error=exc)
+        raise
+
+    print(f"Chain predictions: {len(all_predictions)}")
+    print(f"File observations: {len(all_file_rows)}")
+    print(f"Target-chain observations: {len(all_target_rows)}")
+    print(f"Run directory: {run_dir}")
+    return run_dir
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate PRED-TMBB2 single-sequence JUCHMME on Cooper-Beta data."
-    )
-    parser.add_argument("--positive-dir", default="data/positive")
-    parser.add_argument("--negative-dir", default="data/negative")
-    parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--juchmme-dir", required=True)
-    parser.add_argument(
-        "--manual-manifest",
-        default="",
-        help=(
-            "Optional manual-review manifest with "
-            "filename/final_split/include_for_metrics/policy/reason."
+        prog="python external_methods/pred_tmbb2/evaluate_dataset.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Evaluate the PRED-TMBB2 single-sequence JUCHMME baseline on labeled Cooper-Beta "
+            "structure directories."
+        ),
+        epilog=(
+            "Output: a new timestamped directory under --out-dir with extracted FASTA, upstream "
+            "predictions, normalized file and optional target-chain metrics, and run_manifest.json. "
+            "Input or upstream execution failures exit with status 2."
         ),
     )
-    parser.add_argument("--tag", required=True)
-    parser.add_argument("--min-residues", type=int, default=DEFAULT_MIN_RESIDUES)
+    parser.add_argument(
+        "--positive-dir",
+        required=True,
+        metavar="DIRECTORY",
+        help="Directory containing structures labeled positive.",
+    )
+    parser.add_argument(
+        "--negative-dir",
+        required=True,
+        metavar="DIRECTORY",
+        help="Directory containing structures labeled negative.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        required=True,
+        metavar="DIRECTORY",
+        help="Output root; a fresh timestamped run directory is created.",
+    )
+    parser.add_argument(
+        "--juchmme-dir",
+        required=True,
+        metavar="DIRECTORY",
+        help="PRED-TMBB2 JUCHMME release or checkout directory.",
+    )
+    parser.add_argument(
+        "--metric-level",
+        choices=["file", "chain", "both"],
+        default=DEFAULT_METRIC_LEVEL,
+        help="Metric granularity; file metrics use directory labels and any-positive-chain output.",
+    )
+    parser.add_argument(
+        "--positive-target-manifest",
+        metavar="CSV",
+        help=(
+            "Positive target-selection CSV with exactly relative_path,author_chain_id; required "
+            "with the negative target manifest for chain metrics."
+        ),
+    )
+    parser.add_argument(
+        "--negative-target-manifest",
+        metavar="CSV",
+        help=(
+            "Negative target-selection CSV with exactly relative_path,author_chain_id; required "
+            "with the positive target manifest for chain metrics."
+        ),
+    )
+    parser.add_argument(
+        "--tag",
+        required=True,
+        metavar="NAME",
+        help="Run label included in the output directory name.",
+    )
+    parser.add_argument(
+        "--min-residues",
+        type=int,
+        default=DEFAULT_MIN_RESIDUES,
+        metavar="RESIDUES",
+        help="Minimum declared complete sequence length required to evaluate a chain.",
+    )
     parser.add_argument(
         "--prediction-field",
         default=DEFAULT_PREDICTION_FIELD,
         choices=["LP", "VP", "lp", "vp"],
+        help="JUCHMME topology field used to count membrane beta-strand segments.",
     )
-    parser.add_argument("--min-tm-strands", type=int, default=DEFAULT_MIN_TM_STRANDS)
-    parser.add_argument("--java", default="java")
-    parser.add_argument("--timeout", type=float)
+    parser.add_argument(
+        "--min-tm-strands",
+        type=int,
+        default=DEFAULT_MIN_TM_STRANDS,
+        metavar="N",
+        help="Inclusive minimum predicted membrane beta-strand count for BARREL.",
+    )
+    parser.add_argument(
+        "--java",
+        default="java",
+        metavar="COMMAND",
+        help="Java executable used to run JUCHMME.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Maximum elapsed time for the JUCHMME subprocess; omit for no timeout.",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    manual_manifest = Path(args.manual_manifest).expanduser()
     run_dataset(
-        Path(args.positive_dir).expanduser(),
-        Path(args.negative_dir).expanduser(),
-        Path(args.out_dir).expanduser(),
-        juchmme_dir=Path(args.juchmme_dir).expanduser(),
-        manual_manifest=manual_manifest if str(args.manual_manifest).strip() else None,
+        Path(args.positive_dir),
+        Path(args.negative_dir),
+        Path(args.out_dir),
+        juchmme_dir=Path(args.juchmme_dir),
+        positive_target_manifest=(
+            Path(args.positive_target_manifest) if args.positive_target_manifest else None
+        ),
+        negative_target_manifest=(
+            Path(args.negative_target_manifest) if args.negative_target_manifest else None
+        ),
+        metric_level=args.metric_level,
         min_residues=args.min_residues,
-        prediction_field=args.prediction_field.upper(),
+        prediction_field=args.prediction_field,
         min_tm_strands=args.min_tm_strands,
         java_executable=args.java,
         timeout=args.timeout,

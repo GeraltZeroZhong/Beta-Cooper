@@ -40,7 +40,7 @@ pipeline:
 python external_methods/isitabarrel/structure_map.py \
   path/to/structures \
   --out-dir eval_outputs/isitabarrel_structure_map \
-  --script /path/to/isitabarrel.py \
+  --script path/to/isitabarrel.py \
   --out eval_outputs/isitabarrel_structure_map.csv
 ```
 
@@ -59,9 +59,9 @@ chains.
 
 ```bash
 python external_methods/isitabarrel/runner.py \
-  data/isitabarrel/protid_list.tsv \
-  data/isitabarrel/maps \
-  --script /path/to/isitabarrel.py \
+  path/to/protid_list.tsv \
+  path/to/contact_maps \
+  --script path/to/isitabarrel.py \
   --out eval_outputs/isitabarrel_structure_map.csv
 ```
 

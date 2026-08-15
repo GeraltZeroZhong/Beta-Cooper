@@ -26,21 +26,23 @@ What this script does
 
 Important note
 --------------
-The classification is intentionally conservative. It is designed to separate
-"good canonical positive candidates" from obvious exclusions and review cases.
-You should still inspect the SELF_CONTAINED_WITH_PARTNER_COMPLEX,
-PARTIAL_OR_DOMAIN_ONLY, and NEEDS_REVIEW sets manually.
+The automatic classification creates review strata, not positive ground truth.
+Publication mode requires a frozen approval manifest with one exact author-chain
+target and independent curation evidence per accepted structure; unapproved
+automatic candidates never enter the benchmark positive set.
 
 Recommended usage
 -----------------
 python mpstruc_download_and_classify.py Mpstrucis.txt \
     --out mpstruc_beta_barrels \
+    --mode exploratory \
     --threads 8 \
     --download-related \
     --link-mode symlink
 
 Dependencies
 ------------
+Python >= 3.10
 pip install lxml biopython
 
 Optional override file
@@ -57,35 +59,85 @@ import concurrent.futures as cf
 import csv
 import gzip
 import html
+import http.client
+import itertools
 import json
 import os
 import re
 import shutil
-import sys
 import time
 import traceback
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, TypedDict
+
+from _dataset_provenance import (
+    FrozenStructureArchive,
+    RunManifest,
+    atomic_write_csv,
+    atomic_write_json,
+    input_directory_record,
+    input_file_record,
+    prepare_new_output_directory,
+    require_exact_int,
+    require_finite_real,
+    require_pinned_source_id,
+)
 
 try:
     from Bio.PDB.MMCIF2Dict import MMCIF2Dict
-except Exception as e:  # pragma: no cover
+except ImportError as e:  # pragma: no cover
     raise SystemExit(
-        "Biopython is required. Install with: pip install biopython\n"
-        f"Import error: {e}"
-    )
-
-try:
-    from lxml import etree  # type: ignore
-except Exception:  # pragma: no cover
-    etree = None
+        f"Biopython is required. Install with: pip install biopython\nImport error: {e}"
+    ) from e
 
 
 PDB_ID_RE = re.compile(r"^[0-9A-Za-z]{4}$")
-UNKNOWN_STR = ""
+OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+@dataclass(frozen=True)
+class ClassificationParameters:
+    """Scientific cutoffs used by the preliminary positive-set classifier."""
+
+    canonical_min_beta_strands: int = 8
+    assembly_formed_max_beta_strands: int = 5
+    assembly_formed_min_chain_copies: int = 3
+    partial_modeled_fraction: float = 0.65
+    partial_keyword_modeled_fraction: float = 0.75
+    partial_keyword_min_beta_strands: int = 6
+
+
+class ChainInfo(TypedDict):
+    """Per-chain values used to summarize one protein entity."""
+
+    label_asym_id: str
+    auth_asym_id: str
+    auth_asym_mapping_status: str
+    observed_residues: int
+    beta_strands: int
+    modeled_fraction: float
+
+
+DEFAULT_CLASSIFICATION_PARAMETERS = ClassificationParameters()
+CLASS_LABELS = frozenset(
+    {
+        "SELF_CONTAINED_MONOMER",
+        "SELF_CONTAINED_HOMOOLIGOMER",
+        "SELF_CONTAINED_WITH_PARTNER_COMPLEX",
+        "ASSEMBLY_FORMED_OR_OUT_OF_SCOPE",
+        "PARTIAL_OR_DOMAIN_ONLY",
+        "DESIGNED_OR_OUT_OF_SCOPE",
+        "NEEDS_REVIEW",
+    }
+)
+APPROVAL_REQUIRED_COLUMNS = frozenset(
+    {"filename", "target_author_chain_id", "group_id", "curation_evidence"}
+)
 
 # Conservative keyword rules.
 OUT_OF_SCOPE_KEYWORDS = [
@@ -121,15 +173,11 @@ PARTIAL_KEYWORDS = [
 
 # Sometimes a known good self-contained barrel appears in complex with a partner.
 # You can extend these manually if needed.
-MANUAL_CLASS_OVERRIDES_DEFAULT: Dict[str, Tuple[str, str]] = {
+MANUAL_CLASS_OVERRIDES_DEFAULT: dict[str, tuple[str, str]] = {
     # Example:
     # "8XCJ": ("SELF_CONTAINED_WITH_PARTNER_COMPLEX", "LamB barrel + gpJ partner complex"),
     # "1WP1": ("ASSEMBLY_FORMED_OR_OUT_OF_SCOPE", "OprM-type assembly-formed barrel"),
 }
-
-
-def eprint(*args: Any, **kwargs: Any) -> None:
-    print(*args, file=sys.stderr, **kwargs)
 
 
 def slugify(text: str) -> str:
@@ -144,13 +192,13 @@ def normalize_pdb_code(code: str) -> str:
     return code
 
 
-def sanitize_text(x: Optional[str]) -> str:
+def sanitize_text(x: str | None) -> str:
     if x is None:
         return ""
     return re.sub(r"\s+", " ", html.unescape(str(x))).strip()
 
 
-def as_list(value: Any) -> List[str]:
+def as_list(value: Any) -> list[str]:
     if value is None:
         return []
     if isinstance(value, list):
@@ -158,14 +206,14 @@ def as_list(value: Any) -> List[str]:
     return [str(value)]
 
 
-def safe_get(mapping: Dict[str, Any], *keys: str) -> Optional[Any]:
+def safe_get(mapping: dict[str, Any], *keys: str) -> Any | None:
     for key in keys:
         if key in mapping:
             return mapping[key]
     return None
 
 
-def listify(mapping: Dict[str, Any], *keys: str) -> List[str]:
+def listify(mapping: dict[str, Any], *keys: str) -> list[str]:
     value = safe_get(mapping, *keys)
     if value is None:
         return []
@@ -182,7 +230,7 @@ def seq_len_from_cif_string(seq: str) -> int:
     return len(seq)
 
 
-def parse_mpstruc_xml(path: str, include_related: bool = True) -> List[Dict[str, str]]:
+def parse_mpstruc_xml(path: str, include_related: bool = True) -> list[dict[str, str]]:
     """
     Parse the mpstruc dump using a tolerant line-based state machine.
 
@@ -196,20 +244,20 @@ def parse_mpstruc_xml(path: str, include_related: bool = True) -> List[Dict[str,
 
     tag_re = re.compile(r"<([A-Za-z0-9_:-]+)>(.*?)</\1>")
 
-    def clean_inner_text(s: Optional[str]) -> str:
+    def clean_inner_text(s: str | None) -> str:
         s = s or ""
         s = html.unescape(s)
         s = re.sub(r"<[^>]+>", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    records: List[Dict[str, str]] = []
+    records: list[dict[str, str]] = []
 
     group_name = ""
     subgroup_name = ""
-    current_protein: Optional[Dict[str, Any]] = None
-    current_member: Optional[Dict[str, Any]] = None
-    current_related_owner: Optional[Dict[str, Any]] = None
+    current_protein: dict[str, Any] | None = None
+    current_member: dict[str, Any] | None = None
+    current_related_owner: dict[str, Any] | None = None
 
     def add_record(
         pdb_code: str,
@@ -357,7 +405,9 @@ def parse_mpstruc_xml(path: str, include_related: bool = True) -> List[Dict[str,
             flush_member()
             continue
         if line == "<relatedPdbEntries>":
-            current_related_owner = current_member if current_member is not None else current_protein
+            current_related_owner = (
+                current_member if current_member is not None else current_protein
+            )
             if current_related_owner is not None and "_related" not in current_related_owner:
                 current_related_owner["_related"] = []
             continue
@@ -395,17 +445,28 @@ def parse_mpstruc_xml(path: str, include_related: bool = True) -> List[Dict[str,
     return records
 
 
-def choose_representative_record(records_for_code: List[Dict[str, str]]) -> Dict[str, str]:
+def choose_representative_record(records_for_code: list[dict[str, str]]) -> dict[str, str]:
     priority = {"master": 0, "member": 1, "related_master": 2, "related_member": 3}
-    rec = sorted(records_for_code, key=lambda r: (priority.get(r["source_type"], 99), r["master_pdb_code"], r["parent_pdb_code"]))[0].copy()
+    rec = sorted(
+        records_for_code,
+        key=lambda r: (
+            priority.get(r["source_type"], 99),
+            r["master_pdb_code"],
+            r["parent_pdb_code"],
+        ),
+    )[0].copy()
     rec["all_source_types"] = ";".join(sorted({r["source_type"] for r in records_for_code}))
-    rec["all_subgroups"] = ";".join(sorted({r["subgroup_name"] for r in records_for_code if r["subgroup_name"]}))
-    rec["all_master_pdb_codes"] = ";".join(sorted({r["master_pdb_code"] for r in records_for_code if r["master_pdb_code"]}))
+    rec["all_subgroups"] = ";".join(
+        sorted({r["subgroup_name"] for r in records_for_code if r["subgroup_name"]})
+    )
+    rec["all_master_pdb_codes"] = ";".join(
+        sorted({r["master_pdb_code"] for r in records_for_code if r["master_pdb_code"]})
+    )
     rec["source_record_count"] = str(len(records_for_code))
     return rec
 
 
-def load_overrides(path: Optional[str]) -> Dict[str, Tuple[str, str]]:
+def load_overrides(path: str | None) -> dict[str, tuple[str, str]]:
     overrides = dict(MANUAL_CLASS_OVERRIDES_DEFAULT)
     if not path:
         return overrides
@@ -418,17 +479,122 @@ def load_overrides(path: Optional[str]) -> Dict[str, Tuple[str, str]]:
         fh.seek(0)
         dialect = csv.excel_tab if "\t" in header_line else csv.excel
         reader = csv.DictReader(fh, dialect=dialect)
-        for row in reader:
+        required_columns = {"pdb_code", "class_label", "note"}
+        if not reader.fieldnames or not required_columns.issubset(reader.fieldnames):
+            raise ValueError(
+                f"Override file must contain columns {sorted(required_columns)}: {path}"
+            )
+        seen_codes: set[str] = set()
+        for line_number, row in enumerate(reader, start=2):
             code = normalize_pdb_code(row.get("pdb_code", ""))
             label = sanitize_text(row.get("class_label", ""))
             note = sanitize_text(row.get("note", ""))
-            if code and label:
-                overrides[code] = (label, note)
+            if not PDB_ID_RE.fullmatch(code):
+                raise ValueError(f"Invalid PDB code in override row {line_number}: {code!r}")
+            if label not in CLASS_LABELS:
+                raise ValueError(f"Invalid class label in override row {line_number}: {label!r}")
+            if code in seen_codes:
+                raise ValueError(f"Duplicate PDB override at row {line_number}: {code}")
+            seen_codes.add(code)
+            overrides[code] = (label, note)
     return overrides
 
 
-def urlopen_with_retries(url: str, timeout: int = 30, retries: int = 2, backoff: float = 1.0):
-    last_err: Optional[Exception] = None
+def load_positive_approvals(path: str) -> list[dict[str, str]]:
+    """Load a frozen, human/rule-curated truth manifest without inferring labels."""
+    approval_path = Path(path)
+    with approval_path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames or not APPROVAL_REQUIRED_COLUMNS.issubset(reader.fieldnames):
+            raise ValueError(
+                "Positive approval manifest must contain columns "
+                f"{sorted(APPROVAL_REQUIRED_COLUMNS)}"
+            )
+        approvals: list[dict[str, str]] = []
+        seen_filenames: set[str] = set()
+        for line_number, row in enumerate(reader, start=2):
+            normalized = {
+                column: sanitize_text(row.get(column, "")) for column in APPROVAL_REQUIRED_COLUMNS
+            }
+            filename = Path(normalized["filename"]).name
+            code = normalize_pdb_code(Path(filename).stem)
+            if not PDB_ID_RE.fullmatch(code) or Path(filename).suffix.lower() not in {
+                ".cif",
+                ".mmcif",
+            }:
+                raise ValueError(
+                    f"Approval row {line_number} has invalid structure filename: {filename!r}"
+                )
+            for column in ("target_author_chain_id", "group_id", "curation_evidence"):
+                if not normalized[column]:
+                    raise ValueError(
+                        f"Approval row {line_number} has blank required field {column!r}"
+                    )
+            filename_key = filename.casefold()
+            if filename_key in seen_filenames:
+                raise ValueError(
+                    f"Positive approval manifest must contain exactly one target chain per "
+                    f"structure file; duplicate filename {filename!r}"
+                )
+            seen_filenames.add(filename_key)
+            approvals.append({**normalized, "filename": filename, "pdb_code": code})
+    if not approvals:
+        raise ValueError("Positive approval manifest contains no approved structures")
+    return approvals
+
+
+def match_positive_approvals(
+    approvals: Sequence[dict[str, str]], entry_rows: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Require every approved truth row to match an automatic candidate and chain."""
+    candidates = {
+        str(row["pdb_code"]): row
+        for row in entry_rows
+        if row.get("automatic_candidate_stratum") == "True"
+    }
+    matched: list[dict[str, Any]] = []
+    for approval in approvals:
+        code = approval["pdb_code"]
+        candidate = candidates.get(code)
+        if candidate is None:
+            raise ValueError(
+                f"Approved positive {code} is not an automatically stratified candidate"
+            )
+        allowed_auth_chains = {
+            chain.strip()
+            for chain in str(candidate.get("candidate_auth_asym_ids", "")).split(";")
+            if chain.strip()
+        }
+        representative_author_chain_id = sanitize_text(
+            candidate.get("representative_author_chain_id", "")
+        )
+        if representative_author_chain_id:
+            allowed_auth_chains.add(representative_author_chain_id)
+        if approval["target_author_chain_id"] not in allowed_auth_chains:
+            raise ValueError(
+                f"Approved target chain {approval['target_author_chain_id']!r} for {code} is not an "
+                f"exact parsed author-chain identifier {sorted(allowed_auth_chains)}"
+            )
+        matched.append(
+            {
+                **approval,
+                "target_author_chain_id": approval["target_author_chain_id"],
+                "truth_label": "BARREL",
+                "automatic_class_label": candidate.get("class_label", ""),
+                "entry_cif_path": candidate.get("entry_cif_path", ""),
+                "entry_cif_sha256_recorded_in_run_manifest": True,
+            }
+        )
+    return matched
+
+
+def urlopen_with_retries(
+    url: str,
+    timeout: int = 30,
+    retries: int = 2,
+    backoff: float = 1.0,
+) -> http.client.HTTPResponse:
+    last_err: Exception | None = None
     for i in range(retries + 1):
         try:
             req = urllib.request.Request(
@@ -439,11 +605,14 @@ def urlopen_with_retries(url: str, timeout: int = 30, retries: int = 2, backoff:
                 },
                 method="GET",
             )
-            return urllib.request.urlopen(req, timeout=timeout)
+            response: object = urllib.request.urlopen(req, timeout=timeout)
+            if not isinstance(response, http.client.HTTPResponse):
+                raise TypeError(f"HTTP response for {url} has an unsupported type")
+            return response
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
             last_err = e
             if i < retries:
-                time.sleep(backoff * (2 ** i))
+                time.sleep(backoff * (2**i))
             else:
                 raise
     raise RuntimeError(f"Unreachable retry code for URL {url}: {last_err}")
@@ -458,7 +627,9 @@ def looks_like_cif(path: str) -> bool:
         return False
 
 
-def download_file_variants(urls: Sequence[Tuple[str, str]], out_path: str, timeout: int, retries: int, backoff: float) -> Tuple[bool, str]:
+def download_file_variants(
+    urls: Sequence[tuple[str, str]], out_path: str, timeout: int, retries: int, backoff: float
+) -> tuple[bool, str]:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     tmp_path = out_path + ".tmp"
 
@@ -467,7 +638,9 @@ def download_file_variants(urls: Sequence[Tuple[str, str]], out_path: str, timeo
 
     for url, kind in urls:
         try:
-            with urlopen_with_retries(url, timeout=timeout, retries=retries, backoff=backoff) as resp:
+            with urlopen_with_retries(
+                url, timeout=timeout, retries=retries, backoff=backoff
+            ) as resp:
                 status = getattr(resp, "status", None)
                 if status is not None and status != 200:
                     continue
@@ -505,7 +678,9 @@ def download_file_variants(urls: Sequence[Tuple[str, str]], out_path: str, timeo
     return False, "No usable file from provided URLs"
 
 
-def download_entry_cif(code: str, out_dir: str, timeout: int, retries: int, backoff: float) -> Tuple[str, bool, str, str]:
+def download_entry_cif(
+    code: str, out_dir: str, timeout: int, retries: int, backoff: float
+) -> tuple[str, bool, str, str]:
     code = normalize_pdb_code(code)
     out_path = os.path.join(out_dir, f"{code}.cif")
     urls = [
@@ -516,7 +691,9 @@ def download_entry_cif(code: str, out_dir: str, timeout: int, retries: int, back
     return code, ok, msg, out_path
 
 
-def download_assembly_cif(code: str, assembly_id: str, out_dir: str, timeout: int, retries: int, backoff: float) -> Tuple[str, str, bool, str, str]:
+def download_assembly_cif(
+    code: str, assembly_id: str, out_dir: str, timeout: int, retries: int, backoff: float
+) -> tuple[str, str, bool, str, str]:
     code = normalize_pdb_code(code)
     aid = str(assembly_id).strip()
     out_path = os.path.join(out_dir, f"{code}-assembly{aid}.cif")
@@ -528,7 +705,43 @@ def download_assembly_cif(code: str, assembly_id: str, out_dir: str, timeout: in
     return code, aid, ok, msg, out_path
 
 
-def unique_preserve_order(items: Iterable[str]) -> List[str]:
+def stage_entry_cif(
+    code: str, out_dir: str, archive: FrozenStructureArchive
+) -> tuple[str, bool, str, str]:
+    code = normalize_pdb_code(code)
+    output = Path(out_dir) / f"{code}.cif"
+    aliases = [
+        f"{code}.cif",
+        f"{code}.mmcif",
+        f"{code}.cif.gz",
+        f"{code}.mmcif.gz",
+    ]
+    source = archive.stage(aliases, output)
+    return code, True, f"staged_local:{source.relative_to(archive.root)}", str(output)
+
+
+def stage_assembly_cif(
+    code: str,
+    assembly_id: str,
+    out_dir: str,
+    archive: FrozenStructureArchive,
+) -> tuple[str, str, bool, str, str]:
+    code = normalize_pdb_code(code)
+    assembly = str(assembly_id).strip()
+    output = Path(out_dir) / f"{code}-assembly{assembly}.cif"
+    stem = f"{code}-assembly{assembly}"
+    aliases = [f"{stem}.cif", f"{stem}.mmcif", f"{stem}.cif.gz", f"{stem}.mmcif.gz"]
+    source = archive.stage(aliases, output)
+    return (
+        code,
+        assembly,
+        True,
+        f"staged_local:{source.relative_to(archive.root)}",
+        str(output),
+    )
+
+
+def unique_preserve_order(items: Iterable[str]) -> list[str]:
     seen = set()
     out = []
     for x in items:
@@ -538,17 +751,68 @@ def unique_preserve_order(items: Iterable[str]) -> List[str]:
     return out
 
 
-def parse_cif_summary(cif_path: str) -> Dict[str, Any]:
+def expand_operation_expression(expression: str) -> set[tuple[str, ...]]:
+    """Expand an mmCIF operation expression into unique transformation tuples.
+
+    The mmCIF grammar represents Cartesian products as adjacent parenthesized
+    groups, for example ``(1-3)(4,5)`` has six transformations. A single list
+    such as ``1,2,3`` has three. Malformed expressions are rejected so assembly
+    stoichiometry cannot silently collapse to one copy.
+    """
+    compact = re.sub(r"\s+", "", expression)
+    if compact in {"", ".", "?"}:
+        return {("1",)}
+
+    if compact.startswith("("):
+        groups = re.findall(r"\(([^()]*)\)", compact)
+        if not groups or "".join(f"({group})" for group in groups) != compact:
+            raise ValueError(f"Unsupported operation expression: {expression!r}")
+    else:
+        if "(" in compact or ")" in compact:
+            raise ValueError(f"Malformed operation expression: {expression!r}")
+        groups = [compact]
+
+    expanded_groups: list[list[str]] = []
+    for group in groups:
+        identifiers: set[str] = set()
+        for token in group.split(","):
+            if not token:
+                raise ValueError(f"Empty operation identifier in {expression!r}")
+            numeric_range = re.fullmatch(r"(\d+)-(\d+)", token)
+            if numeric_range:
+                start, end = (int(value) for value in numeric_range.groups())
+                if end < start:
+                    raise ValueError(f"Descending operation range in {expression!r}")
+                identifiers.update(str(value) for value in range(start, end + 1))
+            elif OPERATION_ID_RE.fullmatch(token):
+                identifiers.add(token)
+            else:
+                raise ValueError(f"Invalid operation identifier in {expression!r}")
+        expanded_groups.append(sorted(identifiers))
+    transformations = set(itertools.product(*expanded_groups))
+    if not transformations:
+        raise ValueError(f"Operation expression has no transformations: {expression!r}")
+    return transformations
+
+
+def operation_expression_multiplicity(expression: str) -> int:
+    """Return the number of unique transforms in an mmCIF operation expression."""
+    return len(expand_operation_expression(expression))
+
+
+def parse_cif_summary(cif_path: str) -> dict[str, Any]:
     d = MMCIF2Dict(cif_path)
 
-    entry_id = sanitize_text((as_list(safe_get(d, "_entry.id")) or [Path(cif_path).stem.split("-")[0]])[0]).upper()
+    entry_id = sanitize_text(
+        (as_list(safe_get(d, "_entry.id")) or [Path(cif_path).stem.split("-")[0]])[0]
+    ).upper()
 
     entity_ids = listify(d, "_entity.id")
     entity_types = listify(d, "_entity.type")
     entity_descs = listify(d, "_entity.pdbx_description")
 
-    entity_desc_map: Dict[str, str] = {}
-    entity_type_map: Dict[str, str] = {}
+    entity_desc_map: dict[str, str] = {}
+    entity_type_map: dict[str, str] = {}
     for i, eid in enumerate(entity_ids):
         eid = sanitize_text(eid)
         entity_type_map[eid] = sanitize_text(entity_types[i]) if i < len(entity_types) else ""
@@ -556,13 +820,17 @@ def parse_cif_summary(cif_path: str) -> Dict[str, Any]:
 
     entity_poly_eids = listify(d, "_entity_poly.entity_id")
     entity_poly_types = listify(d, "_entity_poly.type")
-    entity_poly_seq = listify(d, "_entity_poly.pdbx_seq_one_letter_code_can", "_entity_poly.pdbx_seq_one_letter_code")
+    entity_poly_seq = listify(
+        d, "_entity_poly.pdbx_seq_one_letter_code_can", "_entity_poly.pdbx_seq_one_letter_code"
+    )
 
-    entity_poly_type_map: Dict[str, str] = {}
-    entity_seq_len_map: Dict[str, int] = {}
+    entity_poly_type_map: dict[str, str] = {}
+    entity_seq_len_map: dict[str, int] = {}
     for i, eid in enumerate(entity_poly_eids):
         eid = sanitize_text(eid)
-        entity_poly_type_map[eid] = sanitize_text(entity_poly_types[i]) if i < len(entity_poly_types) else ""
+        entity_poly_type_map[eid] = (
+            sanitize_text(entity_poly_types[i]) if i < len(entity_poly_types) else ""
+        )
         if i < len(entity_poly_seq):
             entity_seq_len_map[eid] = seq_len_from_cif_string(entity_poly_seq[i])
 
@@ -575,7 +843,7 @@ def parse_cif_summary(cif_path: str) -> Dict[str, Any]:
 
     struct_asym_ids = listify(d, "_struct_asym.id")
     struct_asym_entity_ids = listify(d, "_struct_asym.entity_id")
-    asym_to_entity: Dict[str, str] = {}
+    asym_to_entity: dict[str, str] = {}
     for i, asym in enumerate(struct_asym_ids):
         asym = sanitize_text(asym)
         eid = sanitize_text(struct_asym_entity_ids[i]) if i < len(struct_asym_entity_ids) else ""
@@ -588,25 +856,71 @@ def parse_cif_summary(cif_path: str) -> Dict[str, Any]:
         if etype.lower() == "polymer" and "polypeptide" in poly_type:
             protein_entity_ids.add(eid)
 
-    # label_asym_id -> auth_asym_id mapping from atom_site
+    # Exact label_asym_id -> auth_asym_id mapping. Candidate truth is expressed
+    # in author-chain identifiers, so missing mappings must never fall back to
+    # label identifiers and ambiguous mappings must never select the first row.
     atom_label_asym = listify(d, "_atom_site.label_asym_id")
     atom_auth_asym = listify(d, "_atom_site.auth_asym_id")
     atom_group_pdb = listify(d, "_atom_site.group_PDB")
     atom_label_seq = listify(d, "_atom_site.label_seq_id")
     atom_comp_id = listify(d, "_atom_site.label_comp_id")
 
-    auth_chain_map: Dict[str, str] = {}
-    observed_residues_by_chain: Dict[str, set] = defaultdict(set)
+    auth_chain_candidates: dict[str, set[str]] = defaultdict(set)
+    for label_column, auth_column in (
+        ("_pdbx_poly_seq_scheme.asym_id", "_pdbx_poly_seq_scheme.pdb_strand_id"),
+        ("_atom_site.label_asym_id", "_atom_site.auth_asym_id"),
+    ):
+        label_values = listify(d, label_column)
+        auth_values = listify(d, auth_column)
+        if not label_values and not auth_values:
+            continue
+        if len(label_values) != len(auth_values):
+            raise ValueError(
+                f"Inconsistent mmCIF author-chain mapping columns {label_column!r} and "
+                f"{auth_column!r}"
+            )
+        for label_value, auth_value in zip(label_values, auth_values, strict=True):
+            label_asym = sanitize_text(label_value)
+            auth_asym = sanitize_text(auth_value)
+            is_protein_polymer_chain = asym_to_entity.get(label_asym) in protein_entity_ids
+            if label_asym and is_protein_polymer_chain and auth_asym not in {"", ".", "?"}:
+                auth_chain_candidates[label_asym].add(auth_asym)
 
-    n_atoms = max(len(atom_label_asym), len(atom_auth_asym), len(atom_group_pdb), len(atom_label_seq), len(atom_comp_id))
+    labels_by_unique_auth: dict[str, set[str]] = defaultdict(set)
+    for label_asym, auth_candidates in auth_chain_candidates.items():
+        if len(auth_candidates) == 1:
+            labels_by_unique_auth[next(iter(auth_candidates))].add(label_asym)
+    auth_chain_map = {
+        label_asym: next(iter(auth_values))
+        for label_asym, auth_values in auth_chain_candidates.items()
+        if len(auth_values) == 1 and len(labels_by_unique_auth[next(iter(auth_values))]) == 1
+    }
+
+    def auth_mapping_status(label_asym: str) -> str:
+        candidates = auth_chain_candidates.get(label_asym, set())
+        if not candidates:
+            return "missing"
+        if len(candidates) != 1:
+            return "ambiguous_multiple_author_chains"
+        auth_asym = next(iter(candidates))
+        if len(labels_by_unique_auth[auth_asym]) != 1:
+            return "ambiguous_multiple_label_chains"
+        return "exact"
+
+    observed_residues_by_chain: dict[str, set[str]] = defaultdict(set)
+
+    n_atoms = max(
+        len(atom_label_asym),
+        len(atom_auth_asym),
+        len(atom_group_pdb),
+        len(atom_label_seq),
+        len(atom_comp_id),
+    )
     for i in range(n_atoms):
         label_asym = sanitize_text(atom_label_asym[i]) if i < len(atom_label_asym) else ""
-        auth_asym = sanitize_text(atom_auth_asym[i]) if i < len(atom_auth_asym) else label_asym
         group_pdb = sanitize_text(atom_group_pdb[i]) if i < len(atom_group_pdb) else ""
         label_seq_id = sanitize_text(atom_label_seq[i]) if i < len(atom_label_seq) else ""
         comp_id = sanitize_text(atom_comp_id[i]) if i < len(atom_comp_id) else ""
-        if label_asym and label_asym not in auth_chain_map and auth_asym:
-            auth_chain_map[label_asym] = auth_asym
         if not label_asym:
             continue
         if group_pdb not in {"ATOM", "HETATM"}:
@@ -617,23 +931,35 @@ def parse_cif_summary(cif_path: str) -> Dict[str, Any]:
             continue
         observed_residues_by_chain[label_asym].add(label_seq_id)
 
-    observed_len_by_chain = {chain: len(res_ids) for chain, res_ids in observed_residues_by_chain.items()}
+    observed_len_by_chain = {
+        chain: len(res_ids) for chain, res_ids in observed_residues_by_chain.items()
+    }
 
     # Count beta-strand ranges per chain.
-    ss_beg_chain = listify(d, "_struct_sheet_range.beg_label_asym_id", "_struct_sheet_range.beg_auth_asym_id")
-    ss_end_chain = listify(d, "_struct_sheet_range.end_label_asym_id", "_struct_sheet_range.end_auth_asym_id")
-    ss_beg_seq = listify(d, "_struct_sheet_range.beg_label_seq_id", "_struct_sheet_range.beg_auth_seq_id")
-    ss_end_seq = listify(d, "_struct_sheet_range.end_label_seq_id", "_struct_sheet_range.end_auth_seq_id")
+    ss_beg_chain = listify(
+        d, "_struct_sheet_range.beg_label_asym_id", "_struct_sheet_range.beg_auth_asym_id"
+    )
+    ss_end_chain = listify(
+        d, "_struct_sheet_range.end_label_asym_id", "_struct_sheet_range.end_auth_asym_id"
+    )
+    ss_beg_seq = listify(
+        d, "_struct_sheet_range.beg_label_seq_id", "_struct_sheet_range.beg_auth_seq_id"
+    )
+    ss_end_seq = listify(
+        d, "_struct_sheet_range.end_label_seq_id", "_struct_sheet_range.end_auth_seq_id"
+    )
     ss_sheet_id = listify(d, "_struct_sheet_range.sheet_id")
-    beta_ranges_by_chain: Dict[str, set] = defaultdict(set)
-    n_ss = max(len(ss_beg_chain), len(ss_end_chain), len(ss_beg_seq), len(ss_end_seq), len(ss_sheet_id))
+    beta_ranges_by_chain: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
+    n_ss = max(
+        len(ss_beg_chain), len(ss_end_chain), len(ss_beg_seq), len(ss_end_seq), len(ss_sheet_id)
+    )
     for i in range(n_ss):
         beg_chain = sanitize_text(ss_beg_chain[i]) if i < len(ss_beg_chain) else ""
         end_chain = sanitize_text(ss_end_chain[i]) if i < len(ss_end_chain) else beg_chain
         if not beg_chain or (end_chain and end_chain != beg_chain):
             continue
         rng = (
-            sanitize_text(ss_sheet_id[i]) if i < len(ss_sheet_id) else f"sheet_{i+1}",
+            sanitize_text(ss_sheet_id[i]) if i < len(ss_sheet_id) else f"sheet_{i + 1}",
             sanitize_text(ss_beg_seq[i]) if i < len(ss_beg_seq) else "",
             sanitize_text(ss_end_seq[i]) if i < len(ss_end_seq) else "",
         )
@@ -644,29 +970,62 @@ def parse_cif_summary(cif_path: str) -> Dict[str, Any]:
     assembly_ids = unique_preserve_order(listify(d, "_pdbx_struct_assembly.id"))
     assembly_gen_ids = listify(d, "_pdbx_struct_assembly_gen.assembly_id")
     assembly_gen_asym_lists = listify(d, "_pdbx_struct_assembly_gen.asym_id_list")
+    assembly_gen_operations = listify(d, "_pdbx_struct_assembly_gen.oper_expression")
 
-    assembly_to_chains: Dict[str, List[str]] = defaultdict(list)
+    assembly_chain_operations: dict[str, dict[str, set[tuple[str, ...]]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    assembly_operation_errors: dict[str, list[str]] = defaultdict(list)
     for i, aid in enumerate(assembly_gen_ids):
         aid = sanitize_text(aid)
-        asym_list = sanitize_text(assembly_gen_asym_lists[i]) if i < len(assembly_gen_asym_lists) else ""
+        asym_list = (
+            sanitize_text(assembly_gen_asym_lists[i]) if i < len(assembly_gen_asym_lists) else ""
+        )
+        operation_expression = (
+            sanitize_text(assembly_gen_operations[i]) if i < len(assembly_gen_operations) else "1"
+        )
+        try:
+            operations = expand_operation_expression(operation_expression)
+        except ValueError as error:
+            assembly_operation_errors[aid].append(str(error))
+            continue
         chains = []
         for token in asym_list.split(","):
             token = token.strip()
             if token:
                 chains.append(token)
-        assembly_to_chains[aid].extend(chains)
+        for chain in chains:
+            assembly_chain_operations[aid][chain].update(operations)
 
-    preferred_assembly_id = "1" if "1" in assembly_ids or "1" in assembly_to_chains else (assembly_ids[0] if assembly_ids else (sorted(assembly_to_chains.keys())[0] if assembly_to_chains else "1"))
-    preferred_assembly_chains = unique_preserve_order(assembly_to_chains.get(preferred_assembly_id, []))
-    if not preferred_assembly_chains:
-        # Fallback: use all chains in entry.
-        preferred_assembly_chains = unique_preserve_order(struct_asym_ids)
+    assembly_chain_copy_counts = {
+        assembly: {chain: len(operations) for chain, operations in chain_map.items()}
+        for assembly, chain_map in assembly_chain_operations.items()
+    }
+
+    preferred_assembly_id = (
+        "1"
+        if "1" in assembly_ids or "1" in assembly_chain_copy_counts
+        else (
+            assembly_ids[0]
+            if assembly_ids
+            else (sorted(assembly_chain_copy_counts)[0] if assembly_chain_copy_counts else "1")
+        )
+    )
+    preferred_chain_copy_counts = dict(assembly_chain_copy_counts.get(preferred_assembly_id, {}))
+    if not preferred_chain_copy_counts:
+        assembly_operation_errors[preferred_assembly_id].append(
+            "preferred assembly has no valid assembly-generation definition"
+        )
+        # Keep asymmetric-unit counts for diagnostics. Classification fails
+        # closed because the preferred biological assembly is unresolved.
+        preferred_chain_copy_counts = dict.fromkeys(unique_preserve_order(struct_asym_ids), 1)
+    preferred_assembly_chains = list(preferred_chain_copy_counts)
 
     # Build protein entity summary.
-    entity_summary: Dict[str, Dict[str, Any]] = {}
+    entity_summary: dict[str, dict[str, Any]] = {}
     for eid in sorted(protein_entity_ids):
         chains = sorted([asym for asym, ent in asym_to_entity.items() if ent == eid])
-        chain_infos = []
+        chain_infos: list[ChainInfo] = []
         for chain in chains:
             seq_len = entity_seq_len_map.get(eid, 0)
             observed_len = observed_len_by_chain.get(chain, 0)
@@ -675,7 +1034,8 @@ def parse_cif_summary(cif_path: str) -> Dict[str, Any]:
             chain_infos.append(
                 {
                     "label_asym_id": chain,
-                    "auth_asym_id": auth_chain_map.get(chain, chain),
+                    "auth_asym_id": auth_chain_map.get(chain, ""),
+                    "auth_asym_mapping_status": auth_mapping_status(chain),
                     "observed_residues": observed_len,
                     "beta_strands": beta_n,
                     "modeled_fraction": modeled_frac,
@@ -692,27 +1052,42 @@ def parse_cif_summary(cif_path: str) -> Dict[str, Any]:
             "max_observed_residues": max([x["observed_residues"] for x in chain_infos], default=0),
             "max_modeled_fraction": max([x["modeled_fraction"] for x in chain_infos], default=0.0),
             "chain_count_entry": len(chains),
-            "chain_count_preferred_assembly": sum(1 for ch in preferred_assembly_chains if asym_to_entity.get(ch) == eid),
+            "chain_count_preferred_assembly": sum(
+                copies
+                for ch, copies in preferred_chain_copy_counts.items()
+                if asym_to_entity.get(ch) == eid
+            ),
         }
 
-    protein_entities_in_preferred_assembly = sorted({asym_to_entity.get(ch, "") for ch in preferred_assembly_chains if asym_to_entity.get(ch, "") in protein_entity_ids})
+    protein_entities_in_preferred_assembly = sorted(
+        {
+            asym_to_entity.get(ch, "")
+            for ch in preferred_assembly_chains
+            if asym_to_entity.get(ch, "") in protein_entity_ids
+        }
+    )
 
     return {
         "entry_id": entry_id,
         "preferred_assembly_id": preferred_assembly_id,
         "preferred_assembly_chains": preferred_assembly_chains,
+        "preferred_assembly_chain_copy_counts": preferred_chain_copy_counts,
+        "assembly_operation_errors": assembly_operation_errors.get(preferred_assembly_id, []),
         "protein_entity_ids": sorted(protein_entity_ids),
         "protein_entities_in_preferred_assembly": protein_entities_in_preferred_assembly,
         "entity_summary": entity_summary,
         "available_assembly_ids": assembly_ids,
         "asym_to_entity": asym_to_entity,
         "auth_chain_map": auth_chain_map,
+        "auth_chain_mapping_status": {
+            chain: auth_mapping_status(chain) for chain in sorted(asym_to_entity)
+        },
         "observed_len_by_chain": observed_len_by_chain,
         "beta_count_by_chain": beta_count_by_chain,
     }
 
 
-def choose_candidate_entity(entity_summary: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def choose_candidate_entity(entity_summary: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
     if not entity_summary:
         return None
     entities = list(entity_summary.values())
@@ -728,18 +1103,26 @@ def choose_candidate_entity(entity_summary: Dict[str, Dict[str, Any]]) -> Option
     return entities[0]
 
 
-def classify_entry(rep: Dict[str, str], cif_summary: Dict[str, Any], overrides: Dict[str, Tuple[str, str]]) -> Dict[str, Any]:
+def classify_entry(
+    rep: dict[str, str],
+    cif_summary: dict[str, Any],
+    overrides: dict[str, tuple[str, str]],
+    parameters: ClassificationParameters = DEFAULT_CLASSIFICATION_PARAMETERS,
+) -> dict[str, Any]:
     code = rep["pdb_code"]
     if code in overrides:
         forced_label, forced_note = overrides[code]
         out = {
             "class_label": forced_label,
             "class_reason": f"manual_override: {forced_note}".strip(),
-            "canonical_positive_candidate": str(forced_label in {
-                "SELF_CONTAINED_MONOMER",
-                "SELF_CONTAINED_HOMOOLIGOMER",
-                "SELF_CONTAINED_WITH_PARTNER_COMPLEX",
-            }),
+            "automatic_candidate_stratum": str(
+                forced_label
+                in {
+                    "SELF_CONTAINED_MONOMER",
+                    "SELF_CONTAINED_HOMOOLIGOMER",
+                    "SELF_CONTAINED_WITH_PARTNER_COMPLEX",
+                }
+            ),
         }
         return out
 
@@ -758,7 +1141,16 @@ def classify_entry(rep: Dict[str, str], cif_summary: Dict[str, Any], overrides: 
         return {
             "class_label": "NEEDS_REVIEW",
             "class_reason": "no_protein_entity_detected",
-            "canonical_positive_candidate": "False",
+            "automatic_candidate_stratum": "False",
+        }
+
+    operation_errors = cif_summary.get("assembly_operation_errors", [])
+    if operation_errors:
+        return {
+            "class_label": "NEEDS_REVIEW",
+            "class_reason": "unresolved_assembly_operation_expression: "
+            + "; ".join(str(error) for error in operation_errors),
+            "automatic_candidate_stratum": "False",
         }
 
     max_beta = int(candidate.get("max_beta_strands", 0))
@@ -777,10 +1169,15 @@ def classify_entry(rep: Dict[str, str], cif_summary: Dict[str, Any], overrides: 
     elif any(k in combined_text for k in OUT_OF_SCOPE_KEYWORDS):
         label = "ASSEMBLY_FORMED_OR_OUT_OF_SCOPE"
         reason = "keyword_out_of_scope"
-    elif modeled_frac < 0.65 or (seq_len > 0 and max_beta >= 6 and modeled_frac < 0.75 and any(k in combined_text for k in PARTIAL_KEYWORDS)):
+    elif modeled_frac < parameters.partial_modeled_fraction or (
+        seq_len > 0
+        and max_beta >= parameters.partial_keyword_min_beta_strands
+        and modeled_frac < parameters.partial_keyword_modeled_fraction
+        and any(k in combined_text for k in PARTIAL_KEYWORDS)
+    ):
         label = "PARTIAL_OR_DOMAIN_ONLY"
         reason = f"low_modeled_fraction_or_partial_keyword(modeled_fraction={modeled_frac:.3f})"
-    elif max_beta >= 8:
+    elif max_beta >= parameters.canonical_min_beta_strands:
         if n_protein_entities_assembly <= 1:
             if n_candidate_chains_assembly <= 1:
                 label = "SELF_CONTAINED_MONOMER"
@@ -791,7 +1188,10 @@ def classify_entry(rep: Dict[str, str], cif_summary: Dict[str, Any], overrides: 
         else:
             label = "SELF_CONTAINED_WITH_PARTNER_COMPLEX"
             reason = f"candidate_entity_has_{max_beta}_beta_strands_plus_partner_entities"
-    elif max_beta <= 5 and n_candidate_chains_assembly >= 3:
+    elif (
+        max_beta <= parameters.assembly_formed_max_beta_strands
+        and n_candidate_chains_assembly >= parameters.assembly_formed_min_chain_copies
+    ):
         label = "ASSEMBLY_FORMED_OR_OUT_OF_SCOPE"
         reason = f"low_per_chain_beta_strands({max_beta})_multichain_assembly"
     else:
@@ -801,11 +1201,14 @@ def classify_entry(rep: Dict[str, str], cif_summary: Dict[str, Any], overrides: 
     return {
         "class_label": label,
         "class_reason": reason,
-        "canonical_positive_candidate": str(label in {
-            "SELF_CONTAINED_MONOMER",
-            "SELF_CONTAINED_HOMOOLIGOMER",
-            "SELF_CONTAINED_WITH_PARTNER_COMPLEX",
-        }),
+        "automatic_candidate_stratum": str(
+            label
+            in {
+                "SELF_CONTAINED_MONOMER",
+                "SELF_CONTAINED_HOMOOLIGOMER",
+                "SELF_CONTAINED_WITH_PARTNER_COMPLEX",
+            }
+        ),
     }
 
 
@@ -829,45 +1232,314 @@ def safe_symlink_or_copy(src: str, dst: str, link_mode: str = "symlink") -> None
     shutil.copy2(src, dst)
 
 
-def write_csv(path: str, rows: List[Dict[str, Any]], fieldnames: Optional[List[str]] = None) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    if rows:
-        keys = set()
-        for row in rows:
-            keys.update(row.keys())
-        header = fieldnames or sorted(keys)
-    else:
-        header = fieldnames or []
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=header, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+def write_csv(path: str, rows: list[dict[str, Any]], fieldnames: list[str] | None = None) -> None:
+    atomic_write_csv(rows, path, fieldnames)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Download and classify mpstruc beta-barrel structures.")
-    ap.add_argument("input_xml", help="Path to mpstruc XML dump (e.g. Mpstrucis.txt)")
-    ap.add_argument("--out", default="mpstruc_beta_barrels", help="Output directory")
-    ap.add_argument("--threads", type=int, default=8, help="Download threads")
-    ap.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
-    ap.add_argument("--retries", type=int, default=2, help="Retries per URL")
-    ap.add_argument("--backoff", type=float, default=0.8, help="Backoff base seconds")
-    ap.add_argument("--download-related", action="store_true", help="Include relatedPdbEntries in addition to master/member entries")
-    ap.add_argument("--skip-download", action="store_true", help="Only parse XML and build manifests; do not download files")
-    ap.add_argument("--skip-assemblies", action="store_true", help="Download entry files only; skip biological assembly files")
-    ap.add_argument("--override-csv", default=None, help="Optional CSV/TSV with pdb_code,class_label,note")
-    ap.add_argument("--link-mode", choices=["symlink", "hardlink", "copy"], default="symlink", help="How to organize classified files")
-    args = ap.parse_args()
+def build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="python data/scripts/mpstruc_download_and_classify.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Parse an mpstruc snapshot, acquire entry-level mmCIF structures, summarize chain "
+            "geometry, and organize beta-barrel candidates for curation."
+        ),
+        epilog=(
+            "Output: parsed and classified metadata CSVs, entry and optional assembly files, "
+            "curation tables, approved positive structures, summary.json, and run_manifest.json. "
+            "The output directory must be new or empty. Argument errors exit with status 2; "
+            "input, download, classification, or approval failures exit nonzero."
+        ),
+    )
+    ap.add_argument(
+        "input_xml",
+        metavar="MPSTRUC_XML",
+        help="Local mpstruc XML/TXT snapshot, such as Mpstrucis.txt.",
+    )
+    ap.add_argument(
+        "--mpstruc-source-id",
+        default=None,
+        metavar="ID",
+        help="mpstruc URL, DOI, or release identifier recorded in provenance.",
+    )
+    ap.add_argument(
+        "--out",
+        default="mpstruc_beta_barrels",
+        metavar="DIRECTORY",
+        help="New output directory for structures, classifications, and run metadata.",
+    )
+    ap.add_argument(
+        "--mode",
+        choices=["publication", "exploratory"],
+        default="publication",
+        help=(
+            "publication uses a local structure archive and an approval manifest; exploratory "
+            "permits downloads and produces candidate tables for curation."
+        ),
+    )
+    ap.add_argument(
+        "--threads", type=int, default=8, metavar="N", help="Concurrent structure downloads."
+    )
+    ap.add_argument(
+        "--timeout", type=int, default=30, metavar="SECONDS", help="Timeout per HTTP request."
+    )
+    ap.add_argument(
+        "--retries", type=int, default=2, metavar="N", help="Retries after each failed request."
+    )
+    ap.add_argument(
+        "--backoff",
+        type=float,
+        default=0.8,
+        metavar="SECONDS",
+        help="Base delay for exponential HTTP retry backoff.",
+    )
+    ap.add_argument(
+        "--download-related",
+        action="store_true",
+        help="Include relatedPdbEntries in addition to mpstruc master and member entries.",
+    )
+    ap.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Parse the snapshot and write metadata without acquiring structure files.",
+    )
+    ap.add_argument(
+        "--skip-assemblies",
+        action="store_true",
+        help="Acquire entry-level mmCIF files without biological assembly files.",
+    )
+    ap.add_argument(
+        "--override-csv",
+        default=None,
+        metavar="CSV",
+        help="Manual classification table with columns pdb_code, class_label, and note.",
+    )
+    ap.add_argument(
+        "--positive-approval-manifest",
+        default=None,
+        metavar="CSV",
+        help=(
+            "Frozen CSV truth manifest with filename,target_author_chain_id,group_id,curation_evidence; "
+            "required in publication mode."
+        ),
+    )
+    ap.add_argument(
+        "--structure-source-dir",
+        default=None,
+        metavar="DIRECTORY",
+        help=(
+            "Local entry-level mmCIF archive; required in publication mode. Exploratory mode "
+            "downloads missing entries when omitted."
+        ),
+    )
+    ap.add_argument(
+        "--structure-source-id",
+        default=None,
+        metavar="ID",
+        help="Coordinate-archive URL, DOI, or release identifier recorded in provenance.",
+    )
+    ap.add_argument(
+        "--link-mode",
+        choices=["symlink", "hardlink", "copy"],
+        default="symlink",
+        help="Filesystem operation used to place structures in classification directories.",
+    )
+    defaults = DEFAULT_CLASSIFICATION_PARAMETERS
+    ap.add_argument(
+        "--canonical-min-beta-strands",
+        type=int,
+        default=defaults.canonical_min_beta_strands,
+        metavar="N",
+        help="Minimum beta-strand count for the automatic canonical-barrel candidate stratum.",
+    )
+    ap.add_argument(
+        "--assembly-formed-max-beta-strands",
+        type=int,
+        default=defaults.assembly_formed_max_beta_strands,
+        metavar="N",
+        help="Maximum per-chain beta-strand count for the assembly-formed candidate stratum.",
+    )
+    ap.add_argument(
+        "--assembly-formed-min-chain-copies",
+        type=int,
+        default=defaults.assembly_formed_min_chain_copies,
+        metavar="N",
+        help="Minimum same-chain copies supporting an assembly-formed candidate.",
+    )
+    ap.add_argument(
+        "--partial-modeled-fraction",
+        type=float,
+        default=defaults.partial_modeled_fraction,
+        metavar="FRACTION",
+        help="Maximum modeled-residue fraction for the partial-structure candidate stratum.",
+    )
+    ap.add_argument(
+        "--partial-keyword-modeled-fraction",
+        type=float,
+        default=defaults.partial_keyword_modeled_fraction,
+        metavar="FRACTION",
+        help="Maximum modeled fraction for entries whose text indicates a partial structure.",
+    )
+    ap.add_argument(
+        "--partial-keyword-min-beta-strands",
+        type=int,
+        default=defaults.partial_keyword_min_beta_strands,
+        metavar="N",
+        help="Minimum beta-strand count for keyword-supported partial candidates.",
+    )
+    return ap
 
-    out_dir = Path(args.out)
+
+def validate_arguments(args: argparse.Namespace) -> ClassificationParameters:
+    require_exact_int("threads", args.threads, minimum=1)
+    require_exact_int("timeout", args.timeout, minimum=1)
+    require_exact_int("retries", args.retries, minimum=0)
+    require_finite_real("backoff", args.backoff, minimum=0.0)
+    input_file_record(args.input_xml, source="local mpstruc snapshot", pinned=True)
+    if args.override_csv:
+        input_file_record(args.override_csv, source="local manual overrides", pinned=True)
+    if args.positive_approval_manifest:
+        input_file_record(
+            args.positive_approval_manifest,
+            source="local frozen positive approvals",
+            pinned=True,
+        )
+        load_positive_approvals(args.positive_approval_manifest)
+    if args.structure_source_dir:
+        input_directory_record(
+            args.structure_source_dir, source="local frozen coordinate archive", pinned=True
+        )
+    if args.mode == "publication":
+        if not args.positive_approval_manifest:
+            raise ValueError(
+                "publication mode requires --positive-approval-manifest; mpstruc/strand-range "
+                "classification alone is not positive ground truth"
+            )
+        if not args.structure_source_dir:
+            raise ValueError(
+                "publication mode requires --structure-source-dir and never downloads live "
+                "RCSB coordinates"
+            )
+        require_pinned_source_id("mpstruc_source_id", args.mpstruc_source_id)
+        require_pinned_source_id("structure_source_id", args.structure_source_id)
+    if args.mode == "publication" and args.skip_download:
+        raise ValueError("--skip-download is exploratory-only because approvals cannot be verified")
+    if args.mode == "publication" and args.skip_assemblies:
+        raise ValueError("--skip-assemblies is exploratory-only in a publication build")
+    for name in ("download_related", "skip_download", "skip_assemblies"):
+        if not isinstance(getattr(args, name), bool):
+            raise ValueError(f"{name} must be a boolean")
+
+    parameters = ClassificationParameters(
+        canonical_min_beta_strands=require_exact_int(
+            "canonical_min_beta_strands", args.canonical_min_beta_strands, minimum=1
+        ),
+        assembly_formed_max_beta_strands=require_exact_int(
+            "assembly_formed_max_beta_strands",
+            args.assembly_formed_max_beta_strands,
+            minimum=0,
+        ),
+        assembly_formed_min_chain_copies=require_exact_int(
+            "assembly_formed_min_chain_copies",
+            args.assembly_formed_min_chain_copies,
+            minimum=2,
+        ),
+        partial_modeled_fraction=require_finite_real(
+            "partial_modeled_fraction", args.partial_modeled_fraction, minimum=0.0, maximum=1.0
+        ),
+        partial_keyword_modeled_fraction=require_finite_real(
+            "partial_keyword_modeled_fraction",
+            args.partial_keyword_modeled_fraction,
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        partial_keyword_min_beta_strands=require_exact_int(
+            "partial_keyword_min_beta_strands",
+            args.partial_keyword_min_beta_strands,
+            minimum=1,
+        ),
+    )
+    if parameters.assembly_formed_max_beta_strands >= parameters.canonical_min_beta_strands:
+        raise ValueError(
+            "assembly_formed_max_beta_strands must be below canonical_min_beta_strands"
+        )
+    if parameters.partial_modeled_fraction > parameters.partial_keyword_modeled_fraction:
+        raise ValueError("partial_modeled_fraction cannot exceed partial_keyword_modeled_fraction")
+    return parameters
+
+
+def _run(
+    args: argparse.Namespace,
+    out_dir: Path,
+    run_manifest: RunManifest,
+    parameters: ClassificationParameters,
+) -> dict[str, object]:
+    inputs: dict[str, object] = {
+        "mpstruc_xml": input_file_record(
+            args.input_xml,
+            source=args.mpstruc_source_id or "local mpstruc snapshot (exploratory)",
+            pinned=True,
+            release=args.mpstruc_source_id,
+        )
+    }
+    if args.override_csv:
+        inputs["manual_overrides"] = input_file_record(
+            args.override_csv, source="local manual overrides", pinned=True
+        )
+    if args.positive_approval_manifest:
+        inputs["positive_approvals"] = input_file_record(
+            args.positive_approval_manifest,
+            source="local frozen positive approvals",
+            pinned=True,
+        )
+    if args.structure_source_dir:
+        inputs["structure_archive"] = input_directory_record(
+            args.structure_source_dir,
+            source=args.structure_source_id or "local coordinate archive (exploratory)",
+            pinned=True,
+        )
+    remote_sources: tuple[dict[str, object], ...] = ()
+    if not args.structure_source_dir:
+        remote_sources = (
+            {
+                "name": "RCSB PDB entry coordinates",
+                "url_templates": [
+                    "https://files.rcsb.org/download/{pdb}.cif",
+                    "https://files.rcsb.org/download/{pdb}.cif.gz",
+                ],
+                "release": "current archive snapshot",
+                "pinned": False,
+                "reproducibility": "every downloaded coordinate file is SHA-256 inventoried",
+            },
+            {
+                "name": "RCSB PDB biological assemblies",
+                "url_templates": [
+                    "https://files.rcsb.org/download/{pdb}-assembly{assembly}.cif",
+                    "https://files.rcsb.org/download/{pdb}-assembly{assembly}.cif.gz",
+                ],
+                "release": "current archive snapshot",
+                "pinned": False,
+                "reproducibility": "every downloaded assembly file is SHA-256 inventoried",
+            },
+        )
+    run_manifest.set_provenance(inputs=inputs, remote_sources=remote_sources)
+
     entries_dir = out_dir / "entries"
     assemblies_dir = out_dir / "assemblies"
     meta_dir = out_dir / "metadata"
     by_subgroup_dir = out_dir / "by_subgroup"
     by_class_dir = out_dir / "by_class"
+    approved_dir = out_dir / "approved_positives"
     logs_dir = out_dir / "logs"
-    for p in [entries_dir, assemblies_dir, meta_dir, by_subgroup_dir, by_class_dir, logs_dir]:
+    for p in [
+        entries_dir,
+        assemblies_dir,
+        meta_dir,
+        by_subgroup_dir,
+        by_class_dir,
+        approved_dir,
+        logs_dir,
+    ]:
         p.mkdir(parents=True, exist_ok=True)
 
     overrides = load_overrides(args.override_csv)
@@ -878,42 +1550,56 @@ def main() -> None:
 
     write_csv(str(meta_dir / "mpstruc_records.csv"), records)
 
-    records_by_code: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    records_by_code: dict[str, list[dict[str, str]]] = defaultdict(list)
     for rec in records:
         records_by_code[rec["pdb_code"]].append(rec)
 
-    unique_entries = [choose_representative_record(records_by_code[code]) for code in sorted(records_by_code.keys())]
+    unique_entries = [
+        choose_representative_record(records_by_code[code])
+        for code in sorted(records_by_code.keys())
+    ]
     write_csv(str(meta_dir / "mpstruc_unique_entries.csv"), unique_entries)
 
     print(f"[INFO] Parsed {len(records)} source records, {len(unique_entries)} unique PDB codes.")
 
-    entry_rows: List[Dict[str, Any]] = []
-    chain_rows: List[Dict[str, Any]] = []
-    download_fail_rows: List[Dict[str, Any]] = []
-    assembly_fail_rows: List[Dict[str, Any]] = []
+    entry_rows: list[dict[str, Any]] = []
+    chain_rows: list[dict[str, Any]] = []
+    download_fail_rows: list[dict[str, Any]] = []
+    assembly_fail_rows: list[dict[str, Any]] = []
+    structure_archive = (
+        FrozenStructureArchive(args.structure_source_dir) if args.structure_source_dir else None
+    )
 
     if args.skip_download:
         print("[INFO] --skip-download enabled. Wrote manifests only.")
-        return
+        return {
+            "n_source_records": len(records),
+            "n_unique_pdb_codes": len(unique_entries),
+            "download_skipped": True,
+        }
 
     # Step 1: download entry mmCIF files.
-    download_results: Dict[str, str] = {}
+    download_results: dict[str, str] = {}
     with cf.ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
-        fut_map = {
-            ex.submit(
-                download_entry_cif,
-                rec["pdb_code"],
-                str(entries_dir),
-                args.timeout,
-                args.retries,
-                args.backoff,
-            ): rec["pdb_code"]
-            for rec in unique_entries
-        }
-        for fut in cf.as_completed(fut_map):
-            code = fut_map[fut]
+        entry_futures: dict[cf.Future[tuple[str, bool, str, str]], str] = {}
+        for rec in unique_entries:
+            code = rec["pdb_code"]
+            if structure_archive is None:
+                entry_future = ex.submit(
+                    download_entry_cif,
+                    code,
+                    str(entries_dir),
+                    args.timeout,
+                    args.retries,
+                    args.backoff,
+                )
+            else:
+                entry_future = ex.submit(stage_entry_cif, code, str(entries_dir), structure_archive)
+            entry_futures[entry_future] = code
+        for entry_completed in cf.as_completed(entry_futures):
+            code = entry_futures[entry_completed]
             try:
-                code, ok, msg, out_path = fut.result()
+                code, ok, msg, out_path = entry_completed.result()
             except Exception as e:
                 ok = False
                 msg = f"Unhandled exception: {e}"
@@ -926,7 +1612,7 @@ def main() -> None:
                 print(f"[FAIL] entry {code}: {msg}")
 
     # Step 2: parse entry mmCIF, classify, and download assemblies.
-    assembly_jobs: List[Tuple[str, str]] = []
+    assembly_jobs: list[tuple[str, str]] = []
     for rep in unique_entries:
         code = rep["pdb_code"]
         cif_path = download_results.get(code)
@@ -936,26 +1622,50 @@ def main() -> None:
                     **rep,
                     "class_label": "DOWNLOAD_FAILED",
                     "class_reason": "entry_cif_download_failed",
-                    "canonical_positive_candidate": "False",
+                    "automatic_candidate_stratum": "False",
                 }
             )
             continue
 
         try:
             cif_summary = parse_cif_summary(cif_path)
-            class_info = classify_entry(rep, cif_summary, overrides)
+            class_info = classify_entry(rep, cif_summary, overrides, parameters)
             candidate = choose_candidate_entity(cif_summary.get("entity_summary", {}))
             candidate_entity_id = candidate.get("entity_id", "") if candidate else ""
             candidate_label_asym = ""
-            candidate_auth_asym = ""
+            representative_author_chain_id = ""
+            candidate_label_asym_ids = ""
+            candidate_auth_asym_ids = ""
             if candidate and candidate.get("chains"):
+                candidate_label_asym_ids = ";".join(
+                    sorted(
+                        {
+                            str(chain.get("label_asym_id", ""))
+                            for chain in candidate["chains"]
+                            if str(chain.get("label_asym_id", ""))
+                        }
+                    )
+                )
+                candidate_auth_asym_ids = ";".join(
+                    sorted(
+                        {
+                            str(chain.get("auth_asym_id", ""))
+                            for chain in candidate["chains"]
+                            if str(chain.get("auth_asym_id", ""))
+                        }
+                    )
+                )
                 best_chain = sorted(
                     candidate["chains"],
-                    key=lambda x: (int(x.get("beta_strands", 0)), float(x.get("modeled_fraction", 0.0)), int(x.get("observed_residues", 0))),
+                    key=lambda x: (
+                        int(x.get("beta_strands", 0)),
+                        float(x.get("modeled_fraction", 0.0)),
+                        int(x.get("observed_residues", 0)),
+                    ),
                     reverse=True,
                 )[0]
                 candidate_label_asym = best_chain.get("label_asym_id", "")
-                candidate_auth_asym = best_chain.get("auth_asym_id", "")
+                representative_author_chain_id = best_chain.get("auth_asym_id", "")
 
             row = {
                 **rep,
@@ -964,15 +1674,29 @@ def main() -> None:
                 "preferred_assembly_id": cif_summary.get("preferred_assembly_id", ""),
                 "available_assembly_ids": ";".join(cif_summary.get("available_assembly_ids", [])),
                 "protein_entity_ids": ";".join(cif_summary.get("protein_entity_ids", [])),
-                "protein_entities_in_preferred_assembly": ";".join(cif_summary.get("protein_entities_in_preferred_assembly", [])),
+                "protein_entities_in_preferred_assembly": ";".join(
+                    cif_summary.get("protein_entities_in_preferred_assembly", [])
+                ),
                 "candidate_entity_id": candidate_entity_id,
                 "candidate_label_asym_id": candidate_label_asym,
-                "candidate_auth_asym_id": candidate_auth_asym,
-                "candidate_entity_max_beta_strands": candidate.get("max_beta_strands", 0) if candidate else 0,
+                "representative_author_chain_id": representative_author_chain_id,
+                "candidate_label_asym_ids": candidate_label_asym_ids,
+                "candidate_auth_asym_ids": candidate_auth_asym_ids,
+                "candidate_entity_max_beta_strands": candidate.get("max_beta_strands", 0)
+                if candidate
+                else 0,
                 "candidate_entity_seq_len": candidate.get("seq_len", 0) if candidate else 0,
-                "candidate_entity_max_modeled_fraction": f"{candidate.get('max_modeled_fraction', 0.0):.3f}" if candidate else "0.000",
-                "candidate_entity_chain_count_entry": candidate.get("chain_count_entry", 0) if candidate else 0,
-                "candidate_entity_chain_count_preferred_assembly": candidate.get("chain_count_preferred_assembly", 0) if candidate else 0,
+                "candidate_entity_max_modeled_fraction": f"{candidate.get('max_modeled_fraction', 0.0):.3f}"
+                if candidate
+                else "0.000",
+                "candidate_entity_chain_count_entry": candidate.get("chain_count_entry", 0)
+                if candidate
+                else 0,
+                "candidate_entity_chain_count_preferred_assembly": candidate.get(
+                    "chain_count_preferred_assembly", 0
+                )
+                if candidate
+                else 0,
             }
             entry_rows.append(row)
 
@@ -994,7 +1718,9 @@ def main() -> None:
                     )
 
             if not args.skip_assemblies:
-                assembly_ids = cif_summary.get("available_assembly_ids", []) or [cif_summary.get("preferred_assembly_id", "1")]
+                assembly_ids = cif_summary.get("available_assembly_ids", []) or [
+                    cif_summary.get("preferred_assembly_id", "1")
+                ]
                 for aid in unique_preserve_order([str(x) for x in assembly_ids if str(x).strip()]):
                     assembly_jobs.append((code, aid))
 
@@ -1005,32 +1731,43 @@ def main() -> None:
                     **rep,
                     "class_label": "PARSE_FAILED",
                     "class_reason": f"parse_error: {e}",
-                    "canonical_positive_candidate": "False",
+                    "automatic_candidate_stratum": "False",
                     "entry_cif_path": cif_path,
                 }
             )
-            download_fail_rows.append({"pdb_code": code, "stage": "parse", "message": str(e), "traceback": tb})
+            download_fail_rows.append(
+                {"pdb_code": code, "stage": "parse", "message": str(e), "traceback": tb}
+            )
             print(f"[FAIL] parse {code}: {e}")
 
     # Step 3: download assembly files.
     if not args.skip_assemblies and assembly_jobs:
         with cf.ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
-            fut_map = {
-                ex.submit(
-                    download_assembly_cif,
-                    code,
-                    aid,
-                    str(assemblies_dir),
-                    args.timeout,
-                    args.retries,
-                    args.backoff,
-                ): (code, aid)
-                for code, aid in assembly_jobs
-            }
-            for fut in cf.as_completed(fut_map):
-                code, aid = fut_map[fut]
+            assembly_futures: dict[cf.Future[tuple[str, str, bool, str, str]], tuple[str, str]] = {}
+            for code, aid in assembly_jobs:
+                if structure_archive is None:
+                    assembly_future = ex.submit(
+                        download_assembly_cif,
+                        code,
+                        aid,
+                        str(assemblies_dir),
+                        args.timeout,
+                        args.retries,
+                        args.backoff,
+                    )
+                else:
+                    assembly_future = ex.submit(
+                        stage_assembly_cif,
+                        code,
+                        aid,
+                        str(assemblies_dir),
+                        structure_archive,
+                    )
+                assembly_futures[assembly_future] = (code, aid)
+            for assembly_completed in cf.as_completed(assembly_futures):
+                code, aid = assembly_futures[assembly_completed]
                 try:
-                    code, aid, ok, msg, out_path = fut.result()
+                    code, aid, ok, msg, out_path = assembly_completed.result()
                 except Exception as e:
                     ok = False
                     msg = f"Unhandled exception: {e}"
@@ -1038,7 +1775,9 @@ def main() -> None:
                 if ok:
                     print(f"[OK] assembly {code}-assembly{aid}: {msg}")
                 else:
-                    assembly_fail_rows.append({"pdb_code": code, "assembly_id": aid, "message": msg})
+                    assembly_fail_rows.append(
+                        {"pdb_code": code, "assembly_id": aid, "message": msg}
+                    )
                     print(f"[FAIL] assembly {code}-assembly{aid}: {msg}")
 
     # Step 4: write metadata.
@@ -1046,12 +1785,35 @@ def main() -> None:
     write_csv(str(meta_dir / "chain_summary.csv"), chain_rows)
     write_csv(str(logs_dir / "download_failed.csv"), download_fail_rows)
     write_csv(str(logs_dir / "assembly_failed.csv"), assembly_fail_rows)
+    if args.mode == "publication" and (download_fail_rows or assembly_fail_rows):
+        raise RuntimeError(
+            "Frozen publication structure archive did not provide a complete, parseable input "
+            f"set (entry/parse failures={len(download_fail_rows)}, "
+            f"assembly failures={len(assembly_fail_rows)})"
+        )
 
-    positive_candidates = [r for r in entry_rows if r.get("canonical_positive_candidate") == "True"]
-    exclusions = [r for r in entry_rows if r.get("class_label") in {"ASSEMBLY_FORMED_OR_OUT_OF_SCOPE", "DESIGNED_OR_OUT_OF_SCOPE"}]
-    review_cases = [r for r in entry_rows if r.get("class_label") in {"PARTIAL_OR_DOMAIN_ONLY", "NEEDS_REVIEW", "PARSE_FAILED", "DOWNLOAD_FAILED"}]
+    automatic_candidates = [
+        row for row in entry_rows if row.get("automatic_candidate_stratum") == "True"
+    ]
+    approved_positives: list[dict[str, Any]] = []
+    if args.positive_approval_manifest:
+        approved_positives = match_positive_approvals(
+            load_positive_approvals(args.positive_approval_manifest), entry_rows
+        )
+    exclusions = [
+        r
+        for r in entry_rows
+        if r.get("class_label") in {"ASSEMBLY_FORMED_OR_OUT_OF_SCOPE", "DESIGNED_OR_OUT_OF_SCOPE"}
+    ]
+    review_cases = [
+        r
+        for r in entry_rows
+        if r.get("class_label")
+        in {"PARTIAL_OR_DOMAIN_ONLY", "NEEDS_REVIEW", "PARSE_FAILED", "DOWNLOAD_FAILED"}
+    ]
 
-    write_csv(str(meta_dir / "d1_positive_candidates.csv"), positive_candidates)
+    write_csv(str(meta_dir / "d1_automatic_candidates_for_review.csv"), automatic_candidates)
+    write_csv(str(meta_dir / "d1_approved_positives.csv"), approved_positives)
     write_csv(str(meta_dir / "d1_exclusions.csv"), exclusions)
     write_csv(str(meta_dir / "d1_review_cases.csv"), review_cases)
 
@@ -1073,10 +1835,19 @@ def main() -> None:
         if preferred_aid:
             assembly_path = assemblies_dir / f"{code}-assembly{preferred_aid}.cif"
             if assembly_path.exists():
-                subgroup_assembly_dst = by_subgroup_dir / subgroup_slug / f"{code}-assembly{preferred_aid}.cif"
-                class_assembly_dst = by_class_dir / class_slug / f"{code}-assembly{preferred_aid}.cif"
+                subgroup_assembly_dst = (
+                    by_subgroup_dir / subgroup_slug / f"{code}-assembly{preferred_aid}.cif"
+                )
+                class_assembly_dst = (
+                    by_class_dir / class_slug / f"{code}-assembly{preferred_aid}.cif"
+                )
                 safe_symlink_or_copy(str(assembly_path), str(subgroup_assembly_dst), args.link_mode)
                 safe_symlink_or_copy(str(assembly_path), str(class_assembly_dst), args.link_mode)
+
+    for approved in approved_positives:
+        source = str(approved["entry_cif_path"])
+        destination = approved_dir / approved["filename"]
+        safe_symlink_or_copy(source, str(destination), args.link_mode)
 
     # Step 6: write a compact JSON summary.
     summary = {
@@ -1084,17 +1855,45 @@ def main() -> None:
         "n_unique_pdb_codes": len(unique_entries),
         "n_download_failures": len(download_fail_rows),
         "n_assembly_failures": len(assembly_fail_rows),
-        "n_positive_candidates": len(positive_candidates),
+        "n_automatic_candidates_for_review": len(automatic_candidates),
+        "n_approved_positives": len(approved_positives),
         "n_exclusions": len(exclusions),
         "n_review_cases": len(review_cases),
-        "class_counts": dict(sorted({k: sum(1 for r in entry_rows if r.get('class_label') == k) for k in sorted({r.get('class_label', '') for r in entry_rows})}.items())),
+        "class_counts": dict(
+            sorted(
+                {
+                    k: sum(1 for r in entry_rows if r.get("class_label") == k)
+                    for k in sorted({r.get("class_label", "") for r in entry_rows})
+                }.items()
+            )
+        ),
     }
-    with open(meta_dir / "summary.json", "w", encoding="utf-8") as fh:
-        json.dump(summary, fh, indent=2, ensure_ascii=False)
+    atomic_write_json(summary, meta_dir / "summary.json")
 
     print("[DONE] Summary:")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     print(f"[DONE] Output directory: {out_dir.resolve()}")
+    return summary
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = build_arg_parser().parse_args(argv)
+    parameters = validate_arguments(args)
+    out_dir = prepare_new_output_directory(args.out)
+    run_manifest = RunManifest(
+        out_dir,
+        __file__,
+        vars(args),
+        mode=args.mode,
+        random_algorithm=None,
+        seed=None,
+    )
+    try:
+        summary = _run(args, out_dir, run_manifest, parameters)
+    except BaseException as error:
+        run_manifest.fail(error)
+        raise
+    run_manifest.complete(summary)
 
 
 if __name__ == "__main__":

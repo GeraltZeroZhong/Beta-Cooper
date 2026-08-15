@@ -1,3 +1,5 @@
+SEQRES   1 A   16  ALA VAL GLY SER THR LEU ILE PHE ALA VAL GLY SER THR
+SEQRES   2 A   16  LEU ILE PHE
 ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C
 ATOM      2  CA  VAL A   2       3.800   0.000   0.000  1.00 20.00           C
 ATOM      3  CA  GLY A   3       7.600   0.000   0.000  1.00 20.00           C
