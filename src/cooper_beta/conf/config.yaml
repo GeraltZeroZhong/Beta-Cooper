@@ -1,11 +1,56 @@
-defaults:
-  - runtime: default
-  - input: default
-  - output: default
-  - slicer: default
-  - analyzer: default
-  - _self_
-
+# Single source of behavioral defaults for Cooper-Beta.
 hydra:
   job:
     chdir: false
+
+runtime:
+  workers: null
+  prepare_workers: null
+  prepare_batch_size: 16
+  analysis_batch_size: 64
+  prepare_in_flight_multiplier: 2
+  analysis_in_flight_multiplier: 2
+  cpu_reserve: 1
+  native_threads_per_process: 1
+  dssp_bin_path: null
+  prepare_cache_enabled: true
+  prepare_cache_dir: null
+  log_level: INFO
+  log_console: true
+  log_jsonl_path: null
+  check_env: false
+
+input:
+  path: ""
+  allowed_suffixes: [.pdb, .cif, .mmcif, .pdb.gz, .cif.gz, .mmcif.gz]
+  model_id: 0
+  strict_chain: true
+  include_nonstandard_amino_acids: true
+  atom_altloc_policy: highest_occupancy
+  disordered_residue_policy: highest_ca_occupancy
+  pdb_parser_permissive: false
+  dssp_failure_policy: error
+  dssp_pdb_export_cryst1_record: "CRYST1 1000.000 1000.000 1000.000  90.00  90.00  90.00 P 1           1"
+  dssp_sheet_codes: [E, B]
+  atom_site_only_max_peptide_bond_distance_angstrom: 1.8
+
+output:
+  csv_path: cooper_beta_results.csv
+  summary_limit: 50
+  write_manifest: true
+  hash_input_files: true
+  existing_artifact_policy: error
+
+strand_adjacency:
+  maximum_ca_distance_angstrom: 6.8
+  minimum_contact_pair_count: 2
+  minimum_contact_residue_count_per_strand: 2
+
+rules:
+  strand_adjacency_count:
+    minimum: 8
+  cycle_strand_count_fraction:
+    minimum_count: 4
+    minimum_fraction: 0.05
+  cycle_rank:
+    minimum: 1

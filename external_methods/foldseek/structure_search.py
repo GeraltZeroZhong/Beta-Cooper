@@ -99,27 +99,54 @@ def run_structure_search_baseline(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run Foldseek global-TMalign on chain structures from PDB/CIF/mmCIF inputs."
+        prog="python external_methods/foldseek/structure_search.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Extract eligible chains from PDB or mmCIF structures, search them with Foldseek "
+            "global TMalign, and normalize one baseline decision per chain."
+        ),
+        epilog=(
+            "Output: generated query chains, residue mapping, and raw Foldseek files under "
+            "--out-dir; --out additionally writes normalized results CSV. Arguments after -- are "
+            "passed to Foldseek easy-search. Input or subprocess failures exit with status 2."
+        ),
     )
-    parser.add_argument("structure_input", help="PDB/CIF/mmCIF query file or directory.")
+    parser.add_argument(
+        "structure_input",
+        metavar="STRUCTURE_OR_DIRECTORY",
+        help="PDB, CIF, or mmCIF query file, or a directory searched recursively.",
+    )
     parser.add_argument(
         "--out-dir",
         required=True,
+        metavar="DIRECTORY",
         help="Working directory for generated chains, metadata, and Foldseek output.",
     )
     target_group = parser.add_mutually_exclusive_group(required=True)
-    target_group.add_argument("--target-db", help="Prebuilt Foldseek target database prefix.")
+    target_group.add_argument(
+        "--target-db", metavar="PREFIX", help="Existing Foldseek target database prefix."
+    )
     target_group.add_argument(
         "--reference-structures",
+        metavar="STRUCTURE_OR_DIRECTORY",
         help="Reference PDB/CIF/mmCIF file or directory to convert with foldseek createdb.",
     )
-    parser.add_argument("--foldseek", help="Foldseek executable. Defaults to FOLDSEEK_BIN or foldseek.")
-    parser.add_argument("--out", help="Optional normalized CSV output path.")
+    parser.add_argument(
+        "--foldseek",
+        metavar="COMMAND",
+        help="Foldseek executable; omit to use FOLDSEEK_BIN, then foldseek on PATH.",
+    )
+    parser.add_argument(
+        "--out",
+        metavar="CSV",
+        help="Normalized result CSV; omit to retain working files and print counts only.",
+    )
     parser.add_argument(
         "--min-residues",
         type=int,
         default=DEFAULT_MIN_RESIDUES,
-        help=f"Minimum CA residue count required for a chain. Default: {DEFAULT_MIN_RESIDUES}.",
+        metavar="RESIDUES",
+        help="Minimum alpha-carbon residue count required to search a chain.",
     )
     parser.add_argument(
         "--create-index",
@@ -130,40 +157,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--alignment-type",
         type=int,
         default=DEFAULT_ALIGNMENT_TYPE,
-        help=f"Foldseek alignment type. Default: {DEFAULT_ALIGNMENT_TYPE} for TMalign.",
+        metavar="N",
+        help="Foldseek --alignment-type value; 1 selects global TMalign.",
     )
     parser.add_argument(
         "--score-mode",
         default=DEFAULT_SCORE_MODE,
         choices=sorted(SUPPORTED_SCORE_MODES),
-        help=f"Per-hit score used for BARREL decisions. Default: {DEFAULT_SCORE_MODE}.",
+        help="Per-hit score used for the threshold decision.",
     )
     parser.add_argument(
         "--score-threshold",
         type=float,
         default=DEFAULT_SCORE_THRESHOLD,
-        help=f"Minimum score for BARREL. Default: {DEFAULT_SCORE_THRESHOLD}.",
+        metavar="FRACTION",
+        help="Inclusive minimum selected hit score for a BARREL decision.",
     )
     parser.add_argument(
         "--min-query-coverage",
         type=float,
         default=DEFAULT_MIN_QUERY_COVERAGE,
-        help=f"Minimum query coverage for eligible hits. Default: {DEFAULT_MIN_QUERY_COVERAGE}.",
+        metavar="FRACTION",
+        help="Inclusive minimum query coverage for an eligible hit, from 0 to 1.",
     )
     parser.add_argument(
         "--min-target-coverage",
         type=float,
         default=DEFAULT_MIN_TARGET_COVERAGE,
-        help=f"Minimum target coverage for eligible hits. Default: {DEFAULT_MIN_TARGET_COVERAGE}.",
+        metavar="FRACTION",
+        help="Inclusive minimum target coverage for an eligible hit, from 0 to 1.",
     )
-    parser.add_argument("--evalue", type=float, default=DEFAULT_EVALUE, help="Foldseek -e value.")
+    parser.add_argument(
+        "--evalue",
+        type=float,
+        default=DEFAULT_EVALUE,
+        metavar="EVALUE",
+        help="Maximum E-value passed to Foldseek easy-search.",
+    )
     parser.add_argument(
         "--max-seqs",
         type=int,
         default=DEFAULT_MAX_SEQS,
-        help="Foldseek --max-seqs value.",
+        metavar="N",
+        help="Maximum candidate sequences passed to Foldseek --max-seqs.",
     )
-    parser.add_argument("--timeout", type=float, help="Optional subprocess timeout in seconds.")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Maximum elapsed time for each Foldseek subprocess; omit for no timeout.",
+    )
     return parser
 
 

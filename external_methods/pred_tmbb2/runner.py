@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,6 +71,8 @@ def _parse_int_float(value: str | None) -> int | None:
     parsed = _parse_float(value)
     if parsed is None:
         return None
+    if not math.isfinite(parsed) or not parsed.is_integer() or parsed <= 0.0:
+        raise ValueError("PRED-TMBB2 sequence length must be a positive integer.")
     return int(parsed)
 
 
@@ -94,7 +97,7 @@ def _clean_sample_id(header: str) -> str:
 
 
 def _record_to_result(
-    record: dict[str, object],
+    record: Mapping[str, str | None],
     *,
     prediction_field: str,
     min_tm_strands: int,
@@ -108,8 +111,8 @@ def _record_to_result(
         raise ValueError(f"PRED-TMBB2 output for {sample_id!r} is missing {prediction_field}.")
 
     tm_strands = _count_tm_strands(topology)
-    reliability = _parse_float(record.get(f"{prediction_field[0]}R"))  # type: ignore[arg-type]
-    algorithm_score = _parse_float(record.get(f"{prediction_field[0]}S"))  # type: ignore[arg-type]
+    reliability = _parse_float(record.get(f"{prediction_field[0]}R"))
+    algorithm_score = _parse_float(record.get(f"{prediction_field[0]}S"))
     decision_rule = f"{prediction_field}_tm_strands>={min_tm_strands}"
 
     return PredTmbb2Result(
@@ -122,12 +125,10 @@ def _record_to_result(
         topology=topology,
         reliability=reliability,
         algorithm_score=algorithm_score,
-        length=_parse_int_float(record.get("length")),  # type: ignore[arg-type]
-        logodds=_parse_float(record.get("logodds")),  # type: ignore[arg-type]
-        max_prob=_parse_float(record.get("max_prob")),  # type: ignore[arg-type]
-        neg_logprob_per_length=_parse_float(  # type: ignore[arg-type]
-            record.get("neg_logprob_per_length")
-        ),
+        length=_parse_int_float(record.get("length")),
+        logodds=_parse_float(record.get("logodds")),
+        max_prob=_parse_float(record.get("max_prob")),
+        neg_logprob_per_length=_parse_float(record.get("neg_logprob_per_length")),
     )
 
 
@@ -143,8 +144,8 @@ def parse_juchmme_stdout(
     if min_tm_strands < 1:
         raise ValueError("min_tm_strands must be >= 1")
 
-    records: list[dict[str, object]] = []
-    current: dict[str, object] | None = None
+    records: list[dict[str, str | None]] = []
+    current: dict[str, str | None] | None = None
 
     def finish_current() -> None:
         if current is not None:
@@ -402,36 +403,61 @@ def _print_summary(results: Sequence[PredTmbb2Result], output_path: str | Path |
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run and normalize the external PRED-TMBB2 single-sequence JUCHMME baseline."
+        prog="python external_methods/pred_tmbb2/runner.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Run the PRED-TMBB2 single-sequence JUCHMME baseline and normalize one BARREL or "
+            "NON_BARREL decision per FASTA record."
+        ),
+        epilog=(
+            "Output: class counts on stdout and normalized rows when --out is set. A sequence is "
+            "BARREL when the selected topology field contains at least --min-tm-strands complete "
+            "membrane beta-strand segments. Input or upstream execution failures exit with status 2."
+        ),
     )
-    parser.add_argument("fasta", help="FASTA file with one or more protein sequences.")
+    parser.add_argument(
+        "fasta", metavar="FASTA", help="FASTA file containing one or more protein sequences."
+    )
     parser.add_argument(
         "--juchmme-dir",
+        metavar="DIRECTORY",
         help="JUCHMME release/checkout directory. Defaults to PRED_TMBB2_JUCHMME_DIR.",
     )
-    parser.add_argument("--work-dir", help="Working directory for the upstream run.")
-    parser.add_argument("--out", help="Optional normalized CSV output path.")
+    parser.add_argument(
+        "--work-dir",
+        metavar="DIRECTORY",
+        help="Persistent working directory; omit to use and remove a temporary directory.",
+    )
+    parser.add_argument(
+        "--out",
+        metavar="CSV",
+        help="Normalized result CSV; omit to print counts without retaining normalized rows.",
+    )
     parser.add_argument(
         "--java",
         default="java",
-        help="Java executable used to run JUCHMME. Default: java.",
+        metavar="COMMAND",
+        help="Java executable used to run JUCHMME.",
     )
     parser.add_argument(
         "--prediction-field",
         default=DEFAULT_PREDICTION_FIELD,
         choices=["LP", "VP", "lp", "vp"],
-        help=f"Topology field used for the decision. Default: {DEFAULT_PREDICTION_FIELD}.",
+        help="JUCHMME topology field used to count membrane beta-strand segments.",
     )
     parser.add_argument(
         "--min-tm-strands",
         type=int,
         default=DEFAULT_MIN_TM_STRANDS,
-        help=(
-            "Minimum predicted TM beta-strand count for BARREL. "
-            f"Default: {DEFAULT_MIN_TM_STRANDS}."
-        ),
+        metavar="N",
+        help="Inclusive minimum predicted membrane beta-strand count for BARREL.",
     )
-    parser.add_argument("--timeout", type=float, help="Optional subprocess timeout in seconds.")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Maximum elapsed time for the JUCHMME subprocess; omit for no timeout.",
+    )
     return parser
 
 

@@ -75,9 +75,7 @@ def load_results_tsv(
         if "MAP_NAME" not in reader.fieldnames:
             raise ValueError("IsItABarrel results must include a MAP_NAME column.")
         if decision_column not in reader.fieldnames:
-            raise ValueError(
-                f"Decision column {decision_column!r} is missing from {results_file}."
-            )
+            raise ValueError(f"Decision column {decision_column!r} is missing from {results_file}.")
 
         for row in reader:
             sample_id = (row.get("MAP_NAME") or "").strip()
@@ -134,9 +132,7 @@ def _resolve_script(script_path: str | Path | None) -> Path:
     if script_path is None:
         script_path = os.environ.get("ISITABARREL_SCRIPT")
     if script_path is None:
-        raise ValueError(
-            "Provide the official isitabarrel.py with --script or ISITABARREL_SCRIPT."
-        )
+        raise ValueError("Provide the official isitabarrel.py with --script or ISITABARREL_SCRIPT.")
     return _require_path(script_path, "IsItABarrel script")
 
 
@@ -221,31 +217,63 @@ def _print_summary(results: Sequence[IsItABarrelResult], output_path: str | Path
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run and normalize the external IsItABarrel baseline."
+        prog="python external_methods/isitabarrel/runner.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Run the official IsItABarrel script on prepared contact maps and normalize one "
+            "BARREL or NON_BARREL decision per protein identifier."
+        ),
+        epilog=(
+            "Output: class counts on stdout and normalized rows when --out is set. A score greater "
+            "than zero in --decision-column produces BARREL; zero or below produces NON_BARREL. "
+            "Arguments after -- are passed to isitabarrel.py. Input or upstream execution failures "
+            "exit with status 2."
+        ),
     )
-    parser.add_argument("protid_list", help="File with one protein id per line.")
-    parser.add_argument("map_dir", help="Directory with <protein-id>.pkl contact maps.")
+    parser.add_argument(
+        "protid_list",
+        metavar="ID_LIST",
+        help="Text file containing one protein identifier per line.",
+    )
+    parser.add_argument(
+        "map_dir",
+        metavar="MAP_DIRECTORY",
+        help="Directory containing one <protein-id>.pkl contact map per identifier.",
+    )
     parser.add_argument(
         "--script",
+        metavar="FILE",
         help="Path to the official isitabarrel.py script. "
         "Defaults to the ISITABARREL_SCRIPT environment variable.",
     )
     parser.add_argument(
         "--work-dir",
-        help="Working directory for the upstream script. Defaults to a temporary directory.",
+        metavar="DIRECTORY",
+        help="Persistent upstream working directory; omit to use and remove a temporary directory.",
     )
-    parser.add_argument("--out", help="Optional normalized CSV output path.")
+    parser.add_argument(
+        "--out",
+        metavar="CSV",
+        help="Normalized result CSV; omit to print counts without retaining normalized rows.",
+    )
     parser.add_argument(
         "--decision-column",
         default=DEFAULT_DECISION_COLUMN,
-        help=f"Score column used for BARREL/NON_BARREL decisions. Default: {DEFAULT_DECISION_COLUMN}.",
+        metavar="COLUMN",
+        help="IsItABarrel results.tsv score column used for the sign-based decision.",
     )
     parser.add_argument(
         "--python",
         default=sys.executable,
+        metavar="COMMAND",
         help="Python executable used to run the upstream script.",
     )
-    parser.add_argument("--timeout", type=float, help="Optional subprocess timeout in seconds.")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Maximum elapsed time for isitabarrel.py; omit for no timeout.",
+    )
     return parser
 
 

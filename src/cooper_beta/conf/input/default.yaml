@@ -1,8 +1,0 @@
-path: ""
-allowed_suffixes:
-  - .pdb
-  - .cif
-  - .mmcif
-min_chain_residues: 20
-min_sheet_residues: 10
-min_informative_slices: 5

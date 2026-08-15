@@ -2,6 +2,8 @@ name: cooperbeta
 channels:
   - conda-forge
 dependencies:
-  - python>=3.10
-  - pip
-  - dssp
+  # This small specification is the human-readable source for conda-lock.yml.
+  # Publication/reproduction runs install the fully hashed lock, not this file.
+  - python=3.12.11
+  - dssp=4.5.3
+  - uv=0.11.19

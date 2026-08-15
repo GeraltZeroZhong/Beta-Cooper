@@ -68,46 +68,71 @@ def run_structure_sequence_baseline(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run PRED-TMBB2 single-sequence JUCHMME on sequences from structures."
+        prog="python external_methods/pred_tmbb2/structure_sequence.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Extract complete chain sequences from PDB or mmCIF structures, run the PRED-TMBB2 "
+            "single-sequence JUCHMME baseline, and normalize one decision per chain."
+        ),
+        epilog=(
+            "Output: sequences.fasta, residue_mapping.csv, and upstream working files under "
+            "--out-dir; --out additionally writes normalized results CSV. Input or upstream "
+            "execution failures exit with status 2."
+        ),
     )
-    parser.add_argument("structure_input", help="PDB/CIF/mmCIF file or directory.")
+    parser.add_argument(
+        "structure_input",
+        metavar="STRUCTURE_OR_DIRECTORY",
+        help="PDB, CIF, or mmCIF file, or a directory searched recursively.",
+    )
     parser.add_argument(
         "--out-dir",
         required=True,
+        metavar="DIRECTORY",
         help="Working directory for generated FASTA, metadata, and upstream output.",
     )
     parser.add_argument(
         "--juchmme-dir",
+        metavar="DIRECTORY",
         help="JUCHMME release/checkout directory. Defaults to PRED_TMBB2_JUCHMME_DIR.",
     )
-    parser.add_argument("--out", help="Optional normalized CSV output path.")
+    parser.add_argument(
+        "--out",
+        metavar="CSV",
+        help="Normalized result CSV; omit to retain working files and print counts only.",
+    )
     parser.add_argument(
         "--min-residues",
         type=int,
         default=DEFAULT_MIN_RESIDUES,
-        help=f"Minimum CA residue count required for a chain. Default: {DEFAULT_MIN_RESIDUES}.",
+        metavar="RESIDUES",
+        help="Minimum declared complete polymer-sequence length required to evaluate a chain.",
     )
     parser.add_argument(
         "--prediction-field",
         default=DEFAULT_PREDICTION_FIELD,
         choices=["LP", "VP", "lp", "vp"],
-        help=f"Topology field used for the decision. Default: {DEFAULT_PREDICTION_FIELD}.",
+        help="JUCHMME topology field used to count membrane beta-strand segments.",
     )
     parser.add_argument(
         "--min-tm-strands",
         type=int,
         default=DEFAULT_MIN_TM_STRANDS,
-        help=(
-            "Minimum predicted TM beta-strand count for BARREL. "
-            f"Default: {DEFAULT_MIN_TM_STRANDS}."
-        ),
+        metavar="N",
+        help="Inclusive minimum predicted membrane beta-strand count for BARREL.",
     )
     parser.add_argument(
         "--java",
         default="java",
-        help="Java executable used to run JUCHMME. Default: java.",
+        metavar="COMMAND",
+        help="Java executable used to run JUCHMME.",
     )
-    parser.add_argument("--timeout", type=float, help="Optional subprocess timeout in seconds.")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Maximum elapsed time for the JUCHMME subprocess; omit for no timeout.",
+    )
     return parser
 
 

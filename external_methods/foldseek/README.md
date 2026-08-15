@@ -41,9 +41,16 @@ foldseek createdb path/to/reference_barrel_chains ref_barrel_db
 foldseek createindex ref_barrel_db tmp_index
 ```
 
-The reference manifest should exclude evaluation-set chains to avoid leakage.
-At minimum, record PDB id, chain id, source dataset, curation notes, and the
-Foldseek version used to build the database.
+The reference set and a family-group manifest are mandatory for dataset
+evaluation. The manifest must assign every query and reference chain to a
+homology group derived independently of the evaluation labels. All reference
+targets from the query's group and PDB id are excluded. In addition, the
+evaluator hashes the exact bytes of every generated single-chain PDB artifact
+and excludes every reference whose normalized-chain SHA-256 equals the query's,
+even if the source was renamed or assigned an incorrect group. Hash coverage is
+validated exactly and fails closed when an artifact cannot be compared
+reliably. PDB-only exclusion is not sufficient because homologous structures
+can occur under different PDB identifiers.
 
 ## Structure-to-Search Workflow
 
@@ -54,7 +61,7 @@ record per analyzable chain and run the baseline:
 python external_methods/foldseek/structure_search.py \
   path/to/query_structures \
   --out-dir eval_outputs/foldseek_tmalign_structure_search \
-  --target-db /path/to/ref_barrel_db \
+  --target-db path/to/ref_barrel_db \
   --out eval_outputs/foldseek_tmalign_structure_search.csv
 ```
 
@@ -83,33 +90,52 @@ installing or vendoring GPL code.
 
 ## Cooper-Beta Dataset Evaluation
 
-The dataset evaluator mirrors the existing external baseline table layout and
-writes both raw-label and manual-reviewed outputs. Manual relabeling is applied
-only when `--manual-manifest` is explicitly provided:
+The dataset evaluator defaults to directory-labelled file metrics: each input
+structure is one observation and is predicted positive when any of its chains
+is predicted as a barrel. Chain metrics are available only with paired,
+pre-specified target-chain manifests for both positive and negative splits.
+Each target manifest must have exactly the columns `relative_path,author_chain_id` and
+exactly one row for every structure file. Other chains in the same structure
+remain unlabeled and never enter chain-level denominators.
 
 ```bash
 python external_methods/foldseek/evaluate_dataset.py \
-  --positive-dir data/positive \
-  --negative-dir data/negative \
-  --out-dir eval_outputs/foldseek_tmalign_structure_search_YYYYMMDD_HHMMSS \
-  --manual-manifest eval_outputs/notes_aware_manifest_20260425_021152/notes_aware_file_manifest.csv \
-  --foldseek tools/foldseek/bin/foldseek \
-  --tag YYYYMMDD_HHMMSS
+  --positive-dir path/to/positive_structures \
+  --negative-dir path/to/negative_structures \
+  --reference-dir path/to/reference_barrel_chains \
+  --group-manifest path/to/foldseek_family_groups.csv \
+  --out-dir eval_outputs \
+  --foldseek path/to/foldseek \
+  --metric-level both \
+  --positive-target-manifest path/to/positive_target_chains.csv \
+  --negative-target-manifest path/to/negative_target_chains.csv \
+  --tag run-1.0.0
 ```
 
-By default, `data/positive` is used as the reference barrel structure set. The
-evaluator excludes all reference target chains from the same PDB id as each
-query before choosing the best hit, so positive examples cannot be classified
-only by matching themselves. It writes:
+There is no implicit reference set. The group manifest has the strict columns
+`split,relative_path,author_chain_id,group_id`, must cover every generated chain in the
+`positive`, `negative`, and `reference` inputs, and must be frozen alongside
+the benchmark. `author_chain_id` is the exact non-blank author-chain identifier. Rows
+with blank author-chain identifiers are rejected because the evaluator requires the
+exact identifier. The
+evaluator excludes every same-family and same-PDB reference
+target, plus every exact normalized-chain content match, before choosing the
+best hit. The manifest records the hash policy, query and reference inventory
+hashes, per-query exclusion categories, and total candidate/observed exclusion
+counts; all normalized-chain hashes are revalidated before completion. Every
+invocation creates a fresh UTC timestamped run directory under `--out-dir`;
+existing runs are never reused or overwritten. It writes:
 
-- `eval_chain_results_<tag>_raw.csv`
-- `eval_file_results_<tag>_raw.csv`
-- `eval_chain_results_<tag>_manual_reviewed.csv`
-- `eval_file_results_<tag>_manual_reviewed.csv`
-- `foldseek_tmalign_structure_search_summary_<tag>.csv`
-- `foldseek_tmalign_structure_search_summary_<tag>.md`
+- `chain_predictions.csv`: all predictions; `is_target_author_chain` identifies
+  the manifest-selected author chain, and only those rows have labels
+- `file_results.csv`: directory-labelled any-chain file observations
+- `target_chain_results.csv`: present only for `chain`/`both` metrics
+- `summary.csv` and `summary.md`: the single predeclared metric scope
+- `evaluation_manifest.json`: running/failed/complete provenance, including
+  normalized parameters, input and executable hashes, sampling semantics, and
+  hashes for every run artifact
 
-The full global-TMalign run is compute-heavy. On the bundled complete
-positive/negative data, the 2026-04-25 run expanded to 1992 positive-reference
-chains and 500 negative query chains, used about 627 MB for outputs, and the
-Foldseek binary itself used about 28 MB.
+Manual post-hoc relabeling is intentionally unsupported. Freeze corrected
+scientific labels in the input split and target manifests before evaluation.
+Missing predictions, invalid results, non-finite scores, unmatched manifest
+targets, and structures that produce no eligible chain all fail closed.

@@ -72,56 +72,79 @@ def run_structure_map_baseline(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run IsItABarrel on structure-derived contact maps."
+        prog="python external_methods/isitabarrel/structure_map.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Generate chain-level alpha-carbon contact maps from PDB or mmCIF structures, run "
+            "IsItABarrel, and normalize one baseline decision per chain."
+        ),
+        epilog=(
+            "Output: contact-map pickle files, protein identifiers, residue mapping, and upstream "
+            "results.tsv under --out-dir; --out additionally writes normalized results CSV. "
+            "Arguments after -- are passed to isitabarrel.py. Runtime failures exit nonzero."
+        ),
     )
-    parser.add_argument("structure_input", help="PDB/CIF/mmCIF file or directory.")
+    parser.add_argument(
+        "structure_input",
+        metavar="STRUCTURE_OR_DIRECTORY",
+        help="PDB, CIF, or mmCIF file, or a directory searched recursively.",
+    )
     parser.add_argument(
         "--out-dir",
         required=True,
+        metavar="DIRECTORY",
         help="Working directory for generated maps, metadata, and upstream output.",
     )
     parser.add_argument(
         "--script",
+        metavar="FILE",
         help="Path to the official isitabarrel.py script. "
         "Defaults to the ISITABARREL_SCRIPT environment variable.",
     )
-    parser.add_argument("--out", help="Optional normalized CSV output path.")
+    parser.add_argument(
+        "--out",
+        metavar="CSV",
+        help="Normalized result CSV; omit to retain working files and print counts only.",
+    )
     parser.add_argument(
         "--cutoff",
         type=float,
         default=DEFAULT_CA_CUTOFF,
-        help=f"CA-CA contact cutoff in Angstrom. Default: {DEFAULT_CA_CUTOFF}.",
+        metavar="ANGSTROMS",
+        help="Inclusive alpha-carbon distance cutoff used to define a contact.",
     )
     parser.add_argument(
         "--local-exclusion",
         type=int,
         default=DEFAULT_LOCAL_EXCLUSION,
-        help=(
-            "Zero contacts where sequence distance is <= this value. "
-            f"Default: {DEFAULT_LOCAL_EXCLUSION}."
-        ),
+        metavar="RESIDUES",
+        help="Set contacts to zero when sequence-index distance is at most this value.",
     )
     parser.add_argument(
         "--min-residues",
         type=int,
         default=DEFAULT_MIN_RESIDUES,
-        help=(
-            "Minimum CA residue count required for a chain. "
-            f"Default: {DEFAULT_MIN_RESIDUES}, which avoids an upstream "
-            "IsItABarrel indexing failure on very short chains."
-        ),
+        metavar="RESIDUES",
+        help="Minimum alpha-carbon residue count required to evaluate a chain.",
     )
     parser.add_argument(
         "--decision-column",
         default=DEFAULT_DECISION_COLUMN,
-        help=f"Score column used for BARREL/NON_BARREL decisions. Default: {DEFAULT_DECISION_COLUMN}.",
+        metavar="COLUMN",
+        help="IsItABarrel results.tsv score column; values greater than zero produce BARREL.",
     )
     parser.add_argument(
         "--python",
         default=sys.executable,
+        metavar="COMMAND",
         help="Python executable used to run the upstream script.",
     )
-    parser.add_argument("--timeout", type=float, help="Optional subprocess timeout in seconds.")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Maximum elapsed time for isitabarrel.py; omit for no timeout.",
+    )
     return parser
 
 

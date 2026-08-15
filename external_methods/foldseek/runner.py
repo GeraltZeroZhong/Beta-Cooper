@@ -12,7 +12,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from Bio.PDB.Chain import Chain
+from Bio.PDB.Model import Model
 from Bio.PDB.Polypeptide import is_aa
+
+if __package__ in {None, ""}:  # pragma: no cover - exercised by subprocess CLI test
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from external_methods.foldseek.structures import _parse_structure, discover_structure_files
 
@@ -169,10 +174,11 @@ def _infer_query_ids(query_structures: Path) -> list[str] | None:
     for structure_path in structure_paths:
         try:
             structure = _parse_structure(structure_path)
-            model = structure[0]
+            model: Model = structure[0]
         except Exception:
             continue
-        for chain in model:
+        chains: Iterable[Chain] = model.get_chains()
+        for chain in chains:
             residues = [
                 residue
                 for residue in chain.get_unpacked_list()
@@ -290,9 +296,7 @@ def load_hits_tsv(
 
 def _score_hit(hit: FoldseekHit, score_mode: str) -> float:
     if score_mode not in SUPPORTED_SCORE_MODES:
-        raise ValueError(
-            "score_mode must be one of: " + ", ".join(sorted(SUPPORTED_SCORE_MODES))
-        )
+        raise ValueError("score_mode must be one of: " + ", ".join(sorted(SUPPORTED_SCORE_MODES)))
     if score_mode == "qtmscore":
         return float(hit.qtmscore or 0.0)
     if score_mode == "ttmscore":
@@ -411,9 +415,7 @@ def summarize_hits(
     min_target_coverage: float = DEFAULT_MIN_TARGET_COVERAGE,
 ) -> list[FoldseekResult]:
     if score_mode not in SUPPORTED_SCORE_MODES:
-        raise ValueError(
-            "score_mode must be one of: " + ", ".join(sorted(SUPPORTED_SCORE_MODES))
-        )
+        raise ValueError("score_mode must be one of: " + ", ".join(sorted(SUPPORTED_SCORE_MODES)))
 
     aliases = dict(query_aliases or {})
     target_alias_map = dict(target_aliases or {})
@@ -429,7 +431,9 @@ def summarize_hits(
         if target_id in ignored_targets.get(sample_id, set()):
             ignored_counts[sample_id] += 1
             continue
-        grouped[sample_id].append(hit if target_id == hit.target else replace(hit, target=target_id))
+        grouped[sample_id].append(
+            hit if target_id == hit.target else replace(hit, target=target_id)
+        )
 
     if query_ids is None:
         ordered_ids = sorted(grouped)
@@ -650,15 +654,48 @@ def _print_summary(results: Sequence[FoldseekResult], output_path: str | Path | 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run and normalize the external Foldseek global-TMalign baseline."
+        prog="python external_methods/foldseek/runner.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Run the Foldseek global-TMalign baseline and normalize one BARREL or NON_BARREL "
+            "decision per query. A query is positive when an eligible hit reaches the selected "
+            "score threshold and both coverage thresholds."
+        ),
+        epilog=(
+            "Output: a row count and class counts on stdout, plus a normalized CSV when --out is "
+            "set. The temporary work directory is removed unless --work-dir is set. Arguments "
+            "after -- are passed to Foldseek easy-search. Input, executable, subprocess, and "
+            "result-format errors exit with status 2."
+        ),
     )
-    parser.add_argument("query_structures", help="PDB/CIF/mmCIF query file, directory, or DB.")
-    parser.add_argument("target", help="Foldseek target DB or reference-structure path.")
-    parser.add_argument("--foldseek", help="Foldseek executable. Defaults to FOLDSEEK_BIN or foldseek.")
-    parser.add_argument("--work-dir", help="Working directory for Foldseek raw outputs.")
-    parser.add_argument("--out", help="Optional normalized CSV output path.")
+    parser.add_argument(
+        "query_structures",
+        metavar="QUERY",
+        help="PDB, CIF, or mmCIF query file or directory, or a Foldseek query database prefix.",
+    )
+    parser.add_argument(
+        "target",
+        metavar="TARGET",
+        help="Foldseek target database prefix or reference structure path.",
+    )
+    parser.add_argument(
+        "--foldseek",
+        metavar="COMMAND",
+        help="Foldseek executable; omit to use FOLDSEEK_BIN, then foldseek on PATH.",
+    )
+    parser.add_argument(
+        "--work-dir",
+        metavar="DIRECTORY",
+        help="Persistent working directory for the Foldseek database and raw hit TSV.",
+    )
+    parser.add_argument(
+        "--out",
+        metavar="CSV",
+        help="Normalized result CSV; omit to print counts without retaining normalized rows.",
+    )
     parser.add_argument(
         "--query-id-list",
+        metavar="FILE",
         help=(
             "Optional text file with one expected query id per line. "
             "Used to emit NON_BARREL rows for queries with no Foldseek hits."
@@ -678,40 +715,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--alignment-type",
         type=int,
         default=DEFAULT_ALIGNMENT_TYPE,
-        help=f"Foldseek alignment type. Default: {DEFAULT_ALIGNMENT_TYPE} for TMalign.",
+        metavar="N",
+        help="Foldseek --alignment-type value; 1 selects global TMalign.",
     )
     parser.add_argument(
         "--score-mode",
         default=DEFAULT_SCORE_MODE,
         choices=sorted(SUPPORTED_SCORE_MODES),
-        help=f"Per-hit score used for BARREL decisions. Default: {DEFAULT_SCORE_MODE}.",
+        help="Per-hit score used for the threshold decision.",
     )
     parser.add_argument(
         "--score-threshold",
         type=float,
         default=DEFAULT_SCORE_THRESHOLD,
-        help=f"Minimum score for BARREL. Default: {DEFAULT_SCORE_THRESHOLD}.",
+        metavar="FRACTION",
+        help="Inclusive minimum selected hit score for a BARREL decision.",
     )
     parser.add_argument(
         "--min-query-coverage",
         type=float,
         default=DEFAULT_MIN_QUERY_COVERAGE,
-        help=f"Minimum query coverage for eligible hits. Default: {DEFAULT_MIN_QUERY_COVERAGE}.",
+        metavar="FRACTION",
+        help="Inclusive minimum query coverage for an eligible hit, from 0 to 1.",
     )
     parser.add_argument(
         "--min-target-coverage",
         type=float,
         default=DEFAULT_MIN_TARGET_COVERAGE,
-        help=f"Minimum target coverage for eligible hits. Default: {DEFAULT_MIN_TARGET_COVERAGE}.",
+        metavar="FRACTION",
+        help="Inclusive minimum target coverage for an eligible hit, from 0 to 1.",
     )
-    parser.add_argument("--evalue", type=float, default=DEFAULT_EVALUE, help="Foldseek -e value.")
+    parser.add_argument(
+        "--evalue",
+        type=float,
+        default=DEFAULT_EVALUE,
+        metavar="EVALUE",
+        help="Maximum E-value passed to Foldseek easy-search.",
+    )
     parser.add_argument(
         "--max-seqs",
         type=int,
         default=DEFAULT_MAX_SEQS,
-        help="Foldseek --max-seqs value.",
+        metavar="N",
+        help="Maximum candidate sequences passed to Foldseek --max-seqs.",
     )
-    parser.add_argument("--timeout", type=float, help="Optional subprocess timeout in seconds.")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Maximum elapsed time for each Foldseek subprocess; omit for no timeout.",
+    )
     return parser
 
 

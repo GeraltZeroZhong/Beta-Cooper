@@ -13,6 +13,12 @@ Each method should provide:
 - smoke-test fixtures under `data/external_methods/` when the runner needs
   project-local test data.
 
+Dataset evaluators use directory-labelled any-chain file metrics by default.
+Chain metrics require paired, frozen positive and negative target-chain
+manifests with exactly one target per file; non-target partner chains remain
+unlabeled. Evaluators create fresh run directories and strict provenance
+manifests and do not support post-hoc manual relabeling.
+
 Current adapters:
 
 - `isitabarrel_structure_map`: structure-derived contact-map baseline.

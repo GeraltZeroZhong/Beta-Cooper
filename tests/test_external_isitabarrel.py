@@ -78,6 +78,39 @@ def test_generate_structure_contact_maps_from_pdb_fixture(tmp_path: Path):
     assert np.allclose(contact_map, contact_map.T)
 
 
+def test_generate_structure_contact_maps_rejects_blank_author_chain(tmp_path: Path):
+    structure = tmp_path / "blank-chain.pdb"
+    structure.write_text(
+        "ATOM      1  CA  ALA     1       1.000   0.000   0.000  1.00 80.00           C\nEND\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Blank author chain identifiers"):
+        generate_structure_contact_maps(structure, tmp_path / "generated", min_residues=1)
+
+
+def test_generate_structure_contact_maps_accepts_atom_unk_polymer(tmp_path: Path):
+    structure = tmp_path / "unknown-polymer.pdb"
+    structure.write_text(
+        "ATOM      1  CA  UNK A   1       1.000   0.000   0.000  1.00 80.00           C\n"
+        "HETATM    2 CA    CA A   2       2.000   0.000   0.000  1.00 80.00          CA\n"
+        "END\n",
+        encoding="utf-8",
+    )
+
+    generated = generate_structure_contact_maps(
+        structure,
+        tmp_path / "generated",
+        min_residues=1,
+    )
+
+    assert len(generated.records) == 1
+    assert generated.records[0].n_residues == 1
+    with Path(generated.residue_mapping_path).open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [(row["residue_name"], row["residue_number"]) for row in rows] == [("UNK", "1")]
+
+
 def test_run_structure_map_baseline_smoke(tmp_path: Path):
     output_csv = tmp_path / "structure_baseline.csv"
 
