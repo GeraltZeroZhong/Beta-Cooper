@@ -148,9 +148,9 @@ flowchart LR
     coordinates[PDB or mmCIF coordinates] --> annotation[Fresh DSSP annotation]
     annotation --> strands[Physical E-strand nodes]
     coordinates --> contacts[Multi-residue C-alpha contacts]
-    strands --> graph[Strand-adjacency graph]
-    contacts --> graph
-    graph --> measurements[Four graph measurements]
+    strands --> strand_graph["Strand-adjacency graph"]
+    contacts --> strand_graph
+    strand_graph --> measurements[Four graph measurements]
     measurements --> rules[Three rule groups]
     rules --> classification[Chain classification]
 ```
